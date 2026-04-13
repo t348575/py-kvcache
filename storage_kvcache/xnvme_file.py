@@ -157,7 +157,7 @@ class XNvmeFileStore:
         uri_ref = ctypes.create_string_buffer(path.encode("utf-8"))
         string_refs.append(uri_ref)
         handle = xnvme.xnvme_file_open(
-            ctypes.cast(uri_ref, ctypes.c_char_p), ctypes.byref(opts)
+            ctypes.cast(uri_ref, ctypes.POINTER(ctypes.c_char)), ctypes.byref(opts)
         )
         if not handle:
             raise RuntimeError(f"xnvme_file_open() failed for {path}")
@@ -177,7 +177,8 @@ class XNvmeFileStore:
             return
         ref = ctypes.create_string_buffer(value.encode("utf-8"))
         string_refs.append(ref)
-        setattr(opts, field_name, ctypes.cast(ref, ctypes.c_char_p))
+        # The generated bindings expose these string fields as LP_c_char.
+        setattr(opts, field_name, ctypes.cast(ref, ctypes.POINTER(ctypes.c_char)))
 
     def _fsync_dir(self, path: str) -> None:
         try:
