@@ -239,6 +239,15 @@ class ParsedKvLayout:
             )
         return staging_tensors
 
+    @staticmethod
+    def _byte_array_view(tensor: torch.Tensor) -> np.ndarray:
+        # Reinterpret as raw bytes so unsupported NumPy dtypes like bfloat16
+        # still serialize and deserialize losslessly.
+        array = tensor.view(torch.uint8).numpy()
+        if not array.flags.c_contiguous:
+            raise ValueError("staging tensor slice must be contiguous")
+        return array.reshape(-1)
+
     def pack_storage_slot(
         self, staging_tensors: list[torch.Tensor], slot_index: int
     ) -> bytes:
@@ -246,10 +255,7 @@ class ParsedKvLayout:
         end = start + self.storage_block_size_factor
         parts: list[bytes] = []
         for tensor in staging_tensors:
-            array = tensor[start:end].numpy()
-            if not array.flags.c_contiguous:
-                raise ValueError("staging tensor slice must be contiguous")
-            parts.append(array.tobytes(order="C"))
+            parts.append(self._byte_array_view(tensor[start:end]).tobytes(order="C"))
         return b"".join(parts)
 
     def unpack_storage_slot(
@@ -271,10 +277,7 @@ class ParsedKvLayout:
             staging_tensors, self.bytes_per_kernel_block
         ):
             expected_nbytes = kernel_block_bytes * self.storage_block_size_factor
-            array = tensor[start:end].numpy()
-            if not array.flags.c_contiguous:
-                raise ValueError("staging tensor slice must be contiguous")
-            byte_view = array.view(np.uint8).reshape(-1)
+            byte_view = self._byte_array_view(tensor[start:end])
             byte_view[:] = np.frombuffer(
                 payload_view[offset : offset + expected_nbytes],
                 dtype=np.uint8,
@@ -505,6 +508,7 @@ class XNvmeOffloadingSpec(OffloadingSpec):
             rank=parallel_config.rank,
             dtype=dtype,
         )
+        os.makedirs(self.file_mapper.base_path, exist_ok=True)
 
     def get_manager(self) -> OffloadingManager:
         if self._manager is None:
