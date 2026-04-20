@@ -2,19 +2,73 @@ from __future__ import annotations
 
 import ctypes
 import os
+import sys
+import threading
+import time
 import uuid
+from collections.abc import Sequence
 from contextlib import contextmanager
-from typing import Any, Iterator
+from dataclasses import dataclass
+from typing import Any, Callable, Iterator
 
 import numpy as np
+from vllm.logger import init_logger
 import xnvme.ctypes_bindings as xnvme_bindings
 import xnvme.ctypes_bindings.api as xnvme
 
 from .fs_config import SharedFileConfig
 
+logger = init_logger("vllm.storage_kvcache.xnvme_file")
+
+_ASYNC_BACKEND_NAMES = {
+    "emu",
+    "io_uring",
+    "io_uring_cmd",
+    "libaio",
+    "nil",
+    "posix",
+    "thrpool",
+}
+
+_DEFAULT_PARALLEL_FILES = 32
+
+_LIBC = ctypes.CDLL(None)
+_LIBC.posix_memalign.argtypes = [
+    ctypes.POINTER(ctypes.c_void_p),
+    ctypes.c_size_t,
+    ctypes.c_size_t,
+]
+_LIBC.posix_memalign.restype = ctypes.c_int
+_LIBC.free.argtypes = [ctypes.c_void_p]
+_LIBC.free.restype = None
+
+
+@dataclass(frozen=True)
+class _TimedStoreResult:
+    stored: bool
+    start_ns: int
+    duration_ns: int
+    parent_path: str | None = None
+
+
+@dataclass(frozen=True)
+class _TimedIoResult:
+    start_ns: int
+    duration_ns: int
+
+
+@dataclass
+class _AlignedIoBuffer:
+    ptr: ctypes.c_void_p
+    array: np.ndarray[Any, np.dtype[np.uint8]]
+
 
 def _xnvme_cmd_ctx_failed(ctx: Any) -> bool:
     return bool(ctx.cpl.status.sc or ctx.cpl.status.sct)
+
+
+def _xnvme_cmd_ctx_result(ctx: Any) -> int:
+    return int(ctx.cpl.result)
 
 
 def _align_up(value: int, alignment: int) -> int:
@@ -35,115 +89,233 @@ class XNvmeFileStore:
         self.config = config
         self.payload_size = payload_size
         self.io_size = _align_up(payload_size, config.io_alignment)
+        self.parallel_files = max(1, min(_DEFAULT_PARALLEL_FILES, os.cpu_count() or 1))
+        self._buffers_by_thread: dict[int, _AlignedIoBuffer] = {}
+        self._buffers_lock = threading.Lock()
+        self.be, self.mem, self.sync, self.async_backend = (
+            self._resolve_file_backend_config()
+        )
+        logger.info(
+            "XNvmeFileStore initialized: root_dir=%s payload_size=%d io_size=%d io_alignment=%d padding=%d direct=%s sync_on_store=%s be=%s sync=%s async=%s mem=%s parallel_files=%d",
+            self.config.root_dir,
+            self.payload_size,
+            self.io_size,
+            self.config.io_alignment,
+            self.io_size - self.payload_size,
+            self.config.direct,
+            self.config.sync_on_store,
+            self.be,
+            self.sync,
+            self.async_backend,
+            self.mem,
+            self.parallel_files,
+        )
 
-    def read_file(self, path: str) -> bytes:
-        stat_result = os.stat(path)
-        if stat_result.st_size < self.io_size:
-            raise IOError(
-                f"shared KV file {path} is too small: {stat_result.st_size} < {self.io_size}"
-            )
+    def read_path_into(
+        self,
+        path: str,
+        slot_index: int,
+        consumer: Callable[[int, np.ndarray[Any, np.dtype[np.uint8]]], None],
+    ) -> _TimedIoResult:
+        start_ns = time.perf_counter_ns()
+        buffer = self._get_thread_buffer()
+        self._read_file(path, buffer)
+        duration_ns = time.perf_counter_ns() - start_ns
+        consumer(slot_index, buffer.array[: self.payload_size])
+        return _TimedIoResult(start_ns=start_ns, duration_ns=duration_ns)
 
-        with self._open_file(path, create=False, truncate=False) as handle:
+    def close(self) -> None:
+        with self._buffers_lock:
+            buffers = list(self._buffers_by_thread.values())
+            self._buffers_by_thread.clear()
+        for buffer in buffers:
+            _LIBC.free(buffer.ptr)
+
+    def fsync_dirs(self, paths: Sequence[str]) -> None:
+        if not self.config.sync_on_store:
+            return
+        for path in set(paths):
+            self._fsync_dir(path)
+
+    def _read_file(self, path: str, buffer: _AlignedIoBuffer) -> None:
+        with self._open_file(path, create=False, truncate=False, write=False) as handle:
             ctx = xnvme.xnvme_file_get_cmd_ctx(handle)
-            buf = xnvme.xnvme_buf_alloc(handle, self.io_size)
-            if not buf:
-                raise RuntimeError("xnvme_buf_alloc() failed")
-            try:
-                err = xnvme.xnvme_file_pread(
-                    ctypes.byref(ctx),
-                    buf,
-                    self.io_size,
-                    0,
-                )
-                if err or _xnvme_cmd_ctx_failed(ctx):
-                    raise IOError(f"xnvme_file_pread() failed for {path}")
-
-                array = np.ctypeslib.as_array(
-                    ctypes.cast(buf, ctypes.POINTER(ctypes.c_uint8)),
-                    shape=(self.io_size,),
-                )
-                return array[: self.payload_size].tobytes()
-            finally:
-                xnvme.xnvme_buf_free(handle, buf)
-
-    def store_if_missing(self, path: str, payload: bytes) -> bool:
-        if len(payload) != self.payload_size:
-            raise ValueError(
-                f"payload size {len(payload)} does not match expected {self.payload_size}"
+            err = xnvme.xnvme_file_pread(
+                ctypes.byref(ctx),
+                ctypes.cast(buffer.ptr, ctypes.POINTER(None)),
+                self.io_size,
+                0,
             )
+            if err or _xnvme_cmd_ctx_failed(ctx):
+                raise IOError(f"xnvme_file_pread() failed for {path}")
+            result_nbytes = _xnvme_cmd_ctx_result(ctx)
+            if result_nbytes != self.io_size:
+                raise IOError(
+                    f"xnvme_file_pread() transferred {result_nbytes} bytes for {path}, expected {self.io_size}"
+                )
+
+    def store_slot_if_missing(
+        self,
+        path: str,
+        slot_index: int,
+        producer: Callable[[int, np.ndarray[Any, np.dtype[np.uint8]]], None],
+    ) -> _TimedStoreResult:
+        parent_path: str | None = None
+        start_ns = time.perf_counter_ns()
         if os.path.exists(path):
-            return False
+            return _TimedStoreResult(
+                stored=False,
+                start_ns=start_ns,
+                duration_ns=time.perf_counter_ns() - start_ns,
+            )
 
         parent = os.path.dirname(path)
         os.makedirs(parent, exist_ok=True)
         temp_path = self._temp_path(path)
-
-        padded_payload = bytearray(self.io_size)
-        padded_payload[: self.payload_size] = payload
+        buffer = self._get_thread_buffer()
+        buffer.array.fill(0)
+        producer(slot_index, buffer.array[: self.payload_size])
 
         try:
-            with self._open_file(temp_path, create=True, truncate=True) as handle:
-                buf = xnvme.xnvme_buf_alloc(handle, self.io_size)
-                if not buf:
-                    raise RuntimeError("xnvme_buf_alloc() failed")
-                try:
-                    array = np.ctypeslib.as_array(
-                        ctypes.cast(buf, ctypes.POINTER(ctypes.c_uint8)),
-                        shape=(self.io_size,),
+            with self._open_file(
+                temp_path, create=True, truncate=True, write=True
+            ) as handle:
+                ctx = xnvme.xnvme_file_get_cmd_ctx(handle)
+                err = xnvme.xnvme_file_pwrite(
+                    ctypes.byref(ctx),
+                    ctypes.cast(buffer.ptr, ctypes.POINTER(None)),
+                    self.io_size,
+                    0,
+                )
+                if err or _xnvme_cmd_ctx_failed(ctx):
+                    raise IOError(f"xnvme_file_pwrite() failed for {temp_path}")
+                result_nbytes = _xnvme_cmd_ctx_result(ctx)
+                if result_nbytes != self.io_size:
+                    raise IOError(
+                        f"xnvme_file_pwrite() transferred {result_nbytes} bytes for {temp_path}, expected {self.io_size}"
                     )
-                    array[:] = np.frombuffer(
-                        padded_payload, dtype=np.uint8, count=self.io_size
-                    )
-
-                    ctx = xnvme.xnvme_file_get_cmd_ctx(handle)
-                    err = xnvme.xnvme_file_pwrite(
-                        ctypes.byref(ctx),
-                        buf,
-                        self.io_size,
-                        0,
-                    )
-                    if err or _xnvme_cmd_ctx_failed(ctx):
-                        raise IOError(f"xnvme_file_pwrite() failed for {temp_path}")
+                if self.config.sync_on_store:
                     sync_err = xnvme.xnvme_file_sync(handle)
                     if sync_err:
                         raise IOError(f"xnvme_file_sync() failed for {temp_path}")
-                finally:
-                    xnvme.xnvme_buf_free(handle, buf)
 
             try:
                 os.link(temp_path, path)
-                self._fsync_dir(parent)
-                return True
+                if self.config.sync_on_store:
+                    parent_path = parent
+                return _TimedStoreResult(
+                    stored=True,
+                    start_ns=start_ns,
+                    duration_ns=time.perf_counter_ns() - start_ns,
+                    parent_path=parent_path,
+                )
             except FileExistsError:
-                return False
+                return _TimedStoreResult(
+                    stored=False,
+                    start_ns=start_ns,
+                    duration_ns=time.perf_counter_ns() - start_ns,
+                )
         finally:
             try:
                 os.unlink(temp_path)
             except FileNotFoundError:
                 pass
 
+    def _get_thread_buffer(self) -> _AlignedIoBuffer:
+        thread_id = threading.get_ident()
+        with self._buffers_lock:
+            buffer = self._buffers_by_thread.get(thread_id)
+            if buffer is not None:
+                return buffer
+
+        alignment = max(self.config.io_alignment, ctypes.sizeof(ctypes.c_void_p))
+        ptr = ctypes.c_void_p()
+        alloc_err = _LIBC.posix_memalign(ctypes.byref(ptr), alignment, self.io_size)
+        if alloc_err != 0 or not ptr.value:
+            raise RuntimeError(f"posix_memalign() failed: {alloc_err}")
+        array = np.ctypeslib.as_array(
+            ctypes.cast(ptr, ctypes.POINTER(ctypes.c_uint8)),
+            shape=(self.io_size,),
+        )
+        buffer = _AlignedIoBuffer(ptr=ptr, array=array)
+        with self._buffers_lock:
+            existing = self._buffers_by_thread.setdefault(thread_id, buffer)
+        if existing is not buffer:
+            _LIBC.free(ptr)
+            return existing
+        return buffer
+
     def _temp_path(self, final_path: str) -> str:
         unique_suffix = f"{os.getpid()}-{uuid.uuid4().hex}"
         return f"{final_path}.tmp-{unique_suffix}"
 
-    def _make_opts(self, *, create: bool, truncate: bool):
+    def _make_opts(self, *, create: bool, truncate: bool, write: bool):
         string_refs: list[ctypes.Array[ctypes.c_char]] = []
         opts = xnvme.xnvme_opts()
         xnvme.xnvme_opts_set_defaults(ctypes.byref(opts))
 
-        self._set_opt_str(opts, string_refs, "be", self.config.be)
-        self._set_opt_str(opts, string_refs, "mem", self.config.mem)
-        self._set_opt_str(opts, string_refs, "sync", self.config.sync)
-        self._set_opt_str(opts, string_refs, "async", self.config.async_backend)
-        self._set_opt_str(opts, string_refs, "admin", self.config.admin)
+        self._set_opt_str(opts, string_refs, "be", self.be)
+        self._set_opt_str(opts, string_refs, "mem", self.mem)
+        self._set_opt_str(opts, string_refs, "sync", self.sync)
+        self._set_opt_str(opts, string_refs, "async", self.async_backend)
 
-        opts.rdwr = 1
+        opts.rdonly = 0 if write else 1
+        opts.wronly = 1 if write else 0
+        opts.rdwr = 0
         opts.direct = 1 if self.config.direct else 0
         opts.create = 1 if create else 0
         opts.truncate = 1 if truncate else 0
         if self.config.create_mode is not None:
             opts.create_mode = self.config.create_mode
-        return opts, string_refs
+        return opts, string_refs, self.be, self.mem, self.sync, self.async_backend
+
+    def _resolve_file_backend_config(
+        self,
+    ) -> tuple[str | None, str | None, str | None, str | None]:
+        be = self.config.be
+        mem = self.config.mem
+        sync = self.config.sync
+        async_backend = self.config.async_backend
+
+        if be in _ASYNC_BACKEND_NAMES:
+            if async_backend is None:
+                async_backend = be
+            logger.warning(
+                "xnvme_be=%s is an async backend name, not a device backend; using be=linux and xnvme_async=%s",
+                be,
+                async_backend,
+            )
+            be = None
+
+        if sys.platform.startswith("linux"):
+            if be is None:
+                be = "linux"
+            elif be != "linux":
+                logger.warning(
+                    "xnvme_be=%s is not valid for shared filesystem paths on Linux; using be=linux",
+                    be,
+                )
+                be = "linux"
+
+            if sync is None:
+                sync = "psync"
+            elif sync != "psync":
+                logger.warning(
+                    "xnvme_sync=%s targets device I/O, not regular files; using sync=psync",
+                    sync,
+                )
+                sync = "psync"
+
+            if async_backend is None:
+                async_backend = "io_uring"
+
+        if self.config.admin is not None:
+            logger.warning(
+                "xnvme_admin=%s is ignored for shared filesystem paths",
+                self.config.admin,
+            )
+
+        return be, mem, sync, async_backend
 
     @contextmanager
     def _open_file(
@@ -152,15 +324,24 @@ class XNvmeFileStore:
         *,
         create: bool,
         truncate: bool,
+        write: bool,
     ) -> Iterator[Any]:
-        opts, string_refs = self._make_opts(create=create, truncate=truncate)
+        opts, string_refs, be, mem, sync, async_backend = self._make_opts(
+            create=create, truncate=truncate, write=write
+        )
         uri_ref = ctypes.create_string_buffer(path.encode("utf-8"))
         string_refs.append(uri_ref)
         handle = xnvme.xnvme_file_open(
             ctypes.cast(uri_ref, ctypes.POINTER(ctypes.c_char)), ctypes.byref(opts)
         )
         if not handle:
-            raise RuntimeError(f"xnvme_file_open() failed for {path}")
+            raise RuntimeError(
+                "xnvme_file_open() failed for "
+                f"{path} with be={be!r}, mem={mem!r}, sync={sync!r}, async={async_backend!r}, "
+                f"direct={bool(opts.direct)}, create={bool(opts.create)}, "
+                f"truncate={bool(opts.truncate)}, rdonly={bool(opts.rdonly)}, "
+                f"wronly={bool(opts.wronly)}"
+            )
         try:
             yield handle
         finally:
