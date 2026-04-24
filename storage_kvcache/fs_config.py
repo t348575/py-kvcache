@@ -44,7 +44,8 @@ def _coerce_bool(value: object | None, *, field_name: str) -> bool | None:
 class SharedFileConfig:
     root_dir: str
     direct: bool = False
-    sync_on_store: bool = True
+    sync_on_store: bool = False
+    parallel_files: int | None = None
     create_mode: int | None = None
     io_alignment: int = 4096
     be: str | None = None
@@ -91,11 +92,16 @@ class SharedFileConfig:
             extra_config.get("io_alignment", extra_config.get("direct_io_alignment")),
             field_name="io_alignment",
         )
+        parallel_files = _coerce_int(
+            extra_config.get("parallel_files", extra_config.get("xnvme_parallel_files")),
+            field_name="parallel_files",
+        )
 
         return cls(
             root_dir=root_dir,
             direct=bool(direct) if direct is not None else False,
-            sync_on_store=True if sync_on_store is None else sync_on_store,
+            sync_on_store=False if sync_on_store is None else sync_on_store,
+            parallel_files=parallel_files,
             create_mode=_coerce_int(
                 resolve("create_mode"), field_name="xnvme_create_mode"
             ),

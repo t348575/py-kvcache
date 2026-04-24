@@ -294,6 +294,15 @@ class _InstrumentedTransferResult:
     cuda_copy_samples: list[Sample]
 
 
+@dataclass
+class _PendingCudaCopy:
+    slot_index: int
+    start_ns: int
+    start_event: torch.cuda.Event
+    end_event: torch.cuda.Event
+    sample_num_bytes: int
+
+
 class XNvmeOffloadingHandler(OffloadingHandler):
     def __init__(
         self,
@@ -308,7 +317,7 @@ class XNvmeOffloadingHandler(OffloadingHandler):
         self.file_store = file_store
         self.staging_slot_capacity = staging_slot_capacity
         self._load_parallelism = max(
-            1, min(self.staging_slot_capacity, self.file_store.parallel_files)
+            1, min(staging_slot_capacity, self.file_store.parallel_files)
         )
         self._executor = ThreadPoolExecutor(
             max_workers=1, thread_name_prefix="kv-xnvme"
@@ -324,8 +333,9 @@ class XNvmeOffloadingHandler(OffloadingHandler):
         self._staging_tensors = self.layout.allocate_staging_tensors(
             staging_slot_capacity
         )
-        self._swap_stream = torch.cuda.Stream()
-        self._swap_event = torch.cuda.Event(enable_timing=False)
+        self._swap_streams = [
+            torch.cuda.Stream() for _ in range(staging_slot_capacity)
+        ]
         self._mapping_buffers = [
             np.empty((self.layout.storage_block_size_factor, 2), dtype=np.int64)
             for _ in range(staging_slot_capacity)
@@ -419,31 +429,54 @@ class XNvmeOffloadingHandler(OffloadingHandler):
             cuda_copy_samples=cuda_copy_samples,
         )
 
-    def _swap_blocks(
+    def _launch_swap_blocks(
         self,
+        slot_index: int,
         src_tensors: list[torch.Tensor],
         dst_tensors: list[torch.Tensor],
         src_to_dst: torch.Tensor,
         sample_num_bytes: int,
-        cuda_copy_samples: list[Sample],
-    ) -> None:
+    ) -> _PendingCudaCopy:
         sample_start_ns = time.perf_counter_ns()
-        with torch.cuda.stream(self._swap_stream):
+        stream = self._swap_streams[slot_index]
+        start_event = torch.cuda.Event(enable_timing=True)
+        end_event = torch.cuda.Event(enable_timing=True)
+        with torch.cuda.stream(stream):
+            start_event.record(stream)
             for src_tensor, dst_tensor, block_bytes in zip(
                 src_tensors,
                 dst_tensors,
                 self.layout.bytes_per_kernel_block,
             ):
                 ops.swap_blocks(src_tensor, dst_tensor, block_bytes, src_to_dst)
-            self._swap_event.record(self._swap_stream)
-        self._swap_event.synchronize()
+            end_event.record(stream)
+        return _PendingCudaCopy(
+            slot_index=slot_index,
+            start_ns=sample_start_ns,
+            start_event=start_event,
+            end_event=end_event,
+            sample_num_bytes=sample_num_bytes,
+        )
+
+    @staticmethod
+    def _complete_cuda_copy(
+        pending: _PendingCudaCopy, cuda_copy_samples: list[Sample]
+    ) -> None:
+        pending.end_event.synchronize()
+        duration_ns = int(
+            pending.start_event.elapsed_time(pending.end_event) * 1_000_000
+        )
         cuda_copy_samples.append(
             (
-                sample_start_ns,
-                time.perf_counter_ns() - sample_start_ns,
-                sample_num_bytes,
+                pending.start_ns,
+                duration_ns,
+                pending.sample_num_bytes,
             )
         )
+
+    @staticmethod
+    def _cuda_copy_done(pending: _PendingCudaCopy) -> bool:
+        return bool(pending.end_event.query())
 
     def _build_block_mapping(
         self,
@@ -469,13 +502,27 @@ class XNvmeOffloadingHandler(OffloadingHandler):
         slot_index: int,
         block_hash: bytes,
         dst_blocks: np.ndarray,
-    ) -> tuple[int, np.ndarray, _TimedIoResult]:
+    ) -> tuple[int, _TimedIoResult, _PendingCudaCopy]:
         result = self.file_store.read_path_into(
             self.file_mapper.get_file_name(block_hash),
             slot_index,
             self._unpack_storage_slot_from_payload,
         )
-        return slot_index, dst_blocks, result
+        src_to_dst = self._build_block_mapping(
+            slot_index,
+            self._slot_block_ids[slot_index],
+            self.layout.storage_block_size_factor,
+            dst_blocks,
+            self.layout.gpu_block_size_factor,
+        )
+        pending_copy = self._launch_swap_blocks(
+            slot_index,
+            self._staging_tensors,
+            self.layout.gpu_tensors,
+            src_to_dst,
+            self.layout.storage_block_bytes,
+        )
+        return slot_index, result, pending_copy
 
     def _store_slot(
         self,
@@ -541,13 +588,15 @@ class XNvmeOffloadingHandler(OffloadingHandler):
         )
         free_slots = list(range(min(self.staging_slot_capacity, total_file_count)))
         inflight: dict[Future[tuple[int, _TimedStoreResult]], int] = {}
+        pending_copies: dict[int, tuple[_PendingCudaCopy, int]] = {}
         next_file_index = 0
         parent_paths: list[str] = []
 
-        def submit_next(slot_index: int) -> None:
+        def launch_next_copy(slot_index: int) -> None:
             nonlocal next_file_index
             if next_file_index >= total_file_count:
                 return
+            file_index = next_file_index
             src_blocks = src_blocks_per_file[next_file_index]
             src_to_dst = self._build_block_mapping(
                 slot_index,
@@ -556,26 +605,44 @@ class XNvmeOffloadingHandler(OffloadingHandler):
                 self._slot_block_ids[slot_index],
                 self.layout.storage_block_size_factor,
             )
-            self._swap_blocks(
-                self.layout.gpu_tensors,
-                self._staging_tensors,
-                src_to_dst,
-                self.layout.storage_block_bytes,
-                cuda_copy_samples,
+            pending_copies[slot_index] = (
+                self._launch_swap_blocks(
+                    slot_index,
+                    self.layout.gpu_tensors,
+                    self._staging_tensors,
+                    src_to_dst,
+                    self.layout.storage_block_bytes,
+                ),
+                file_index,
             )
+            next_file_index += 1
+
+        def submit_store(slot_index: int, file_index: int) -> None:
             future = self._pipeline_executor.submit(
                 self._store_slot,
                 slot_index,
-                dst_spec.block_hashes[next_file_index],
+                dst_spec.block_hashes[file_index],
             )
             inflight[future] = slot_index
-            next_file_index += 1
+
+        def drain_ready_copies(*, force: bool = False) -> None:
+            for slot_index, (pending, file_index) in list(pending_copies.items()):
+                if force or self._cuda_copy_done(pending):
+                    self._complete_cuda_copy(pending, cuda_copy_samples)
+                    pending_copies.pop(slot_index)
+                    submit_store(slot_index, file_index)
 
         for slot_index in free_slots:
-            submit_next(slot_index)
+            launch_next_copy(slot_index)
 
-        while inflight:
-            done, _pending = wait(inflight, return_when=FIRST_COMPLETED)
+        while inflight or pending_copies:
+            drain_ready_copies()
+            if not inflight:
+                drain_ready_copies(force=True)
+                continue
+            done, _pending = wait(inflight, timeout=0.001, return_when=FIRST_COMPLETED)
+            if not done:
+                continue
             for future in done:
                 inflight.pop(future)
                 slot_index, item = future.result()
@@ -588,7 +655,7 @@ class XNvmeOffloadingHandler(OffloadingHandler):
                 )
                 if item.parent_path:
                     parent_paths.append(item.parent_path)
-                submit_next(slot_index)
+                launch_next_copy(slot_index)
 
         if parent_paths:
             self.file_store.fsync_dirs(parent_paths)
@@ -613,7 +680,8 @@ class XNvmeOffloadingHandler(OffloadingHandler):
             self._get_first_group_block_index(dst_spec),
         )
         free_slots = list(range(min(self.staging_slot_capacity, total_file_count)))
-        inflight: dict[Future[tuple[int, np.ndarray, _TimedIoResult]], int] = {}
+        inflight: dict[Future[tuple[int, _TimedIoResult, _PendingCudaCopy]], int] = {}
+        pending_copies: dict[int, _PendingCudaCopy] = {}
         next_file_index = 0
 
         def submit_next(slot_index: int) -> None:
@@ -629,14 +697,31 @@ class XNvmeOffloadingHandler(OffloadingHandler):
             inflight[future] = slot_index
             next_file_index += 1
 
+        def drain_ready_copies(*, force: bool = False) -> None:
+            for slot_index, pending in list(pending_copies.items()):
+                if force or self._cuda_copy_done(pending):
+                    self._complete_cuda_copy(pending, cuda_copy_samples)
+                    pending_copies.pop(slot_index)
+                    submit_next(slot_index)
+
         for slot_index in free_slots:
             submit_next(slot_index)
 
-        while inflight:
-            done, _pending = wait(inflight, return_when=FIRST_COMPLETED)
+        while inflight or pending_copies:
+            drain_ready_copies()
+            if inflight:
+                done, _pending = wait(
+                    inflight, timeout=0.001, return_when=FIRST_COMPLETED
+                )
+            else:
+                done = set()
+                if pending_copies:
+                    drain_ready_copies(force=True)
+            if not done:
+                continue
             for future in done:
-                slot_index = inflight.pop(future)
-                slot_index, dst_blocks, result = future.result()
+                inflight.pop(future)
+                slot_index, result, pending_copy = future.result()
                 file_io_samples.append(
                     (
                         result.start_ns,
@@ -644,21 +729,7 @@ class XNvmeOffloadingHandler(OffloadingHandler):
                         self.layout.storage_block_bytes,
                     )
                 )
-                src_to_dst = self._build_block_mapping(
-                    slot_index,
-                    self._slot_block_ids[slot_index],
-                    self.layout.storage_block_size_factor,
-                    dst_blocks,
-                    self.layout.gpu_block_size_factor,
-                )
-                self._swap_blocks(
-                    self._staging_tensors,
-                    self.layout.gpu_tensors,
-                    src_to_dst,
-                    self.layout.storage_block_bytes,
-                    cuda_copy_samples,
-                )
-                submit_next(slot_index)
+                pending_copies[slot_index] = pending_copy
 
         return total_file_count * self.layout.storage_block_bytes
 
@@ -898,9 +969,9 @@ class XNvmeOffloadingSpec(OffloadingSpec):
         if configured_num_blocks is not None:
             slot_capacity = int(configured_num_blocks)
         else:
-            configured_bytes = self.extra_config.get("staging_bytes_to_use")
+            configured_gb = self.extra_config.get("staging_mem")
             staging_bytes_to_use = (
-                int(configured_bytes) if configured_bytes is not None else 256 << 20
+                int(configured_gb) * (1 << 30) if configured_gb is not None else 1 << 30
             )
             slot_capacity = staging_bytes_to_use // layout.storage_block_bytes
 
