@@ -343,16 +343,30 @@ class XNvmeOffloadingSpec(OffloadingSpec):
                 getattr(profiler, "_active", False),
                 self.file_mapper.base_path,
             )
-            from .xnvme_engines import create_xnvme_offloading_handler
+            from .xnvme_engines import (
+                create_xnvme_offloading_handler,
+                normalize_xnvme_engine_name,
+            )
+
+            engine_name = normalize_xnvme_engine_name(self.shared_file_config.engine)
+            if engine_name in {"liburing_single_threaded", "liburing_multithreaded"}:
+                from .liburing_file import LiburingFileStore
+
+                file_store = LiburingFileStore(
+                    self.shared_file_config,
+                    payload_size=layout.storage_block_bytes,
+                )
+            else:
+                file_store = XNvmeFileStore(
+                    self.shared_file_config,
+                    payload_size=layout.storage_block_bytes,
+                )
 
             self._handler = create_xnvme_offloading_handler(
                 engine=self.shared_file_config.engine,
                 layout=layout,
                 file_mapper=self.file_mapper,
-                file_store=XNvmeFileStore(
-                    self.shared_file_config,
-                    payload_size=layout.storage_block_bytes,
-                ),
+                file_store=file_store,
                 staging_slot_capacity=staging_slot_capacity,
             )
 

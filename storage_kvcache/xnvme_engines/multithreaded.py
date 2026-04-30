@@ -64,7 +64,7 @@ class MultithreadedXNvmeOffloadingHandler(OffloadingHandler):
             1, min(staging_slot_capacity, self.file_store.parallel_files)
         )
         self._executor = ThreadPoolExecutor(
-            max_workers=1, thread_name_prefix="kv-xnvme"
+            max_workers=self._load_parallelism, thread_name_prefix="kv-xnvme"
         )
         self._pipeline_executor = ThreadPoolExecutor(
             max_workers=self._load_parallelism,

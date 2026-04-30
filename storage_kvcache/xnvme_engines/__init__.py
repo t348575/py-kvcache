@@ -5,6 +5,8 @@ from vllm.v1.kv_offload.worker.worker import OffloadingHandler
 from ..file_mapper import FileMapper
 from ..vllm_xnvme import ParsedKvLayout
 from ..xnvme_file import XNvmeFileStore
+from ..liburing_file import LiburingFileStore
+from .liburing_single_threaded import LiburingSingleThreadedOffloadingHandler
 from .multithreaded import MultithreadedXNvmeOffloadingHandler
 from .single_threaded import SingleThreadedXNvmeOffloadingHandler
 
@@ -15,8 +17,28 @@ def normalize_xnvme_engine_name(engine: str | None) -> str:
         return "multithreaded"
     if normalized in {"single", "single_thread", "single_threaded"}:
         return "single_threaded"
+    if normalized in {
+        "uring",
+        "liburing",
+        "io_uring",
+        "liburing_single",
+        "liburing_single_thread",
+        "liburing_single_threaded",
+    }:
+        return "liburing_single_threaded"
+    if normalized in {
+        "uring_threaded",
+        "uring_multithreaded",
+        "uring_multi_threaded",
+        "liburing_threaded",
+        "liburing_multithreaded",
+        "liburing_multi_threaded",
+        "io_uring_threaded",
+        "io_uring_multithreaded",
+    }:
+        return "liburing_multithreaded"
     raise ValueError(
-        "xnvme_engine must be one of: multithreaded, single_threaded"
+        "xnvme_engine must be one of: multithreaded, single_threaded, liburing_single_threaded, liburing_multithreaded"
     )
 
 
@@ -25,13 +47,15 @@ def create_xnvme_offloading_handler(
     engine: str | None,
     layout: ParsedKvLayout,
     file_mapper: FileMapper,
-    file_store: XNvmeFileStore,
+    file_store: XNvmeFileStore | LiburingFileStore,
     staging_slot_capacity: int,
 ) -> OffloadingHandler:
     engine_name = normalize_xnvme_engine_name(engine)
     handler_cls = {
         "multithreaded": MultithreadedXNvmeOffloadingHandler,
         "single_threaded": SingleThreadedXNvmeOffloadingHandler,
+        "liburing_single_threaded": LiburingSingleThreadedOffloadingHandler,
+        "liburing_multithreaded": MultithreadedXNvmeOffloadingHandler,
     }[engine_name]
     return handler_cls(
         layout=layout,

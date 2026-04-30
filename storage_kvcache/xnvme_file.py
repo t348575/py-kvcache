@@ -29,7 +29,7 @@ _ASYNC_BACKEND_NAMES = {
     "thrpool",
 }
 
-_DEFAULT_PARALLEL_FILES = 64
+_DEFAULT_PARALLEL_FILES = 16
 
 _LIBC = ctypes.CDLL(None)
 _LIBC.posix_memalign.argtypes = [

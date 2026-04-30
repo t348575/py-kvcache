@@ -46,6 +46,7 @@ class SharedFileConfig:
     direct: bool = False
     sync_on_store: bool = False
     parallel_files: int | None = None
+    uring_depth: int | None = None
     engine: str = "multithreaded"
     create_mode: int | None = None
     io_alignment: int = 4096
@@ -97,6 +98,10 @@ class SharedFileConfig:
             extra_config.get("parallel_files", extra_config.get("xnvme_parallel_files")),
             field_name="parallel_files",
         )
+        uring_depth = _coerce_int(
+            extra_config.get("uring_depth", extra_config.get("io_uring_depth")),
+            field_name="uring_depth",
+        )
         engine = _coerce_str(
             extra_config.get("engine", resolve("engine")),
             field_name="xnvme_engine",
@@ -107,6 +112,7 @@ class SharedFileConfig:
             direct=bool(direct) if direct is not None else False,
             sync_on_store=False if sync_on_store is None else sync_on_store,
             parallel_files=parallel_files,
+            uring_depth=uring_depth,
             engine=engine or "multithreaded",
             create_mode=_coerce_int(
                 resolve("create_mode"), field_name="xnvme_create_mode"
