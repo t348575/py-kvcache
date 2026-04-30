@@ -21,7 +21,7 @@ from vllm.v1.kv_offload.worker.worker import (
 )
 import xnvme.ctypes_bindings.api as xnvme
 
-from simple_profiler import profiler
+from simple_profiler import profile_scope, profiler
 
 from ..file_mapper import FileMapper
 from ..vllm_xnvme import (
@@ -197,14 +197,19 @@ class SingleThreadedXNvmeOffloadingHandler(OffloadingHandler):
         done = threading.Event()
         self._known_jobs.add(job_id)
         self._job_done_events[job_id] = done
-        self._submission_queue.put(
-            _SubmittedTransferJob(
-                job_id=job_id,
-                spec=spec,
-                meta=(time.perf_counter_ns(), profile_tid, req_id, direction),
-                done=done,
+        with profile_scope(
+            "storage_kvcache.single.enqueue_transfer",
+            "kv_offload",
+            args={"job_id": job_id, "direction": direction},
+        ):
+            self._submission_queue.put(
+                _SubmittedTransferJob(
+                    job_id=job_id,
+                    spec=spec,
+                    meta=(time.perf_counter_ns(), profile_tid, req_id, direction),
+                    done=done,
+                )
             )
-        )
         self._wake_worker.set()
         return True
 
@@ -321,9 +326,18 @@ class SingleThreadedXNvmeOffloadingHandler(OffloadingHandler):
         )
         uri_ref = ctypes.create_string_buffer(path.encode("utf-8"))
         string_refs.append(uri_ref)
+        open_start_ns = time.perf_counter_ns()
         handle = xnvme.xnvme_file_open(
             ctypes.cast(uri_ref, ctypes.POINTER(ctypes.c_char)), ctypes.byref(opts)
         )
+        if profiler._active:
+            profiler.add_event(
+                "storage_kvcache.single.file_open",
+                "fs",
+                open_start_ns,
+                time.perf_counter_ns() - open_start_ns,
+                args={"write": write, "create": create, "truncate": truncate},
+            )
         if not handle:
             raise RuntimeError(
                 "xnvme_file_open() failed for "
@@ -334,13 +348,15 @@ class SingleThreadedXNvmeOffloadingHandler(OffloadingHandler):
             )
 
         queue = ctypes.POINTER(xnvme.xnvme_queue)()
-        queue_err = xnvme.xnvme_queue_init(handle, 1, 0, ctypes.byref(queue))
+        with profile_scope("storage_kvcache.single.queue_init", "fs"):
+            queue_err = xnvme.xnvme_queue_init(handle, 1, 0, ctypes.byref(queue))
         if queue_err or not queue:
             xnvme.xnvme_file_close(handle)
             op = "write" if write else "read"
             raise IOError(f"xnvme_queue_init() failed for {op} of {path}: {queue_err}")
 
-        ctx = xnvme.xnvme_queue_get_cmd_ctx(queue)
+        with profile_scope("storage_kvcache.single.queue_get_ctx", "fs"):
+            ctx = xnvme.xnvme_queue_get_cmd_ctx(queue)
         if not ctx:
             xnvme.xnvme_queue_term(queue)
             xnvme.xnvme_file_close(handle)
@@ -348,12 +364,21 @@ class SingleThreadedXNvmeOffloadingHandler(OffloadingHandler):
 
         ptr = ctypes.cast(buffer.ptr, ctypes.POINTER(None))
         start_ns = time.perf_counter_ns()
+        submit_start_ns = start_ns
         if write:
             io_err = xnvme.xnvme_file_pwrite(ctx, ptr, self.file_store.io_size, 0)
             op_name = "xnvme_file_pwrite"
         else:
             io_err = xnvme.xnvme_file_pread(ctx, ptr, self.file_store.io_size, 0)
             op_name = "xnvme_file_pread"
+        if profiler._active:
+            profiler.add_event(
+                f"storage_kvcache.single.{op_name}_submit",
+                "fs",
+                submit_start_ns,
+                time.perf_counter_ns() - submit_start_ns,
+                args={"io_size": self.file_store.io_size},
+            )
         if io_err:
             xnvme.xnvme_queue_put_cmd_ctx(queue, ctx)
             xnvme.xnvme_queue_term(queue)
@@ -375,12 +400,20 @@ class SingleThreadedXNvmeOffloadingHandler(OffloadingHandler):
         )
 
     def _poll_file_io(self, op: _QueuedFileIo) -> _TimedIoResult | None:
+        poll_start_ns = time.perf_counter_ns()
         if xnvme.xnvme_queue_get_outstanding(op.queue):
             poke_err = xnvme.xnvme_queue_poke(op.queue, 0)
             if poke_err < 0:
                 self._close_file_io(op)
                 raise IOError(f"xnvme_queue_poke() failed for {op.path}: {poke_err}")
             if xnvme.xnvme_queue_get_outstanding(op.queue):
+                if profiler._active:
+                    profiler.add_event(
+                        "storage_kvcache.single.poll_file_io_pending",
+                        "fs",
+                        poll_start_ns,
+                        time.perf_counter_ns() - poll_start_ns,
+                    )
                 return None
 
         result = op.ctx.contents
@@ -399,11 +432,27 @@ class SingleThreadedXNvmeOffloadingHandler(OffloadingHandler):
             )
         duration_ns = time.perf_counter_ns() - op.start_ns
         if op.write and self.file_store.config.sync_on_store:
+            sync_start_ns = time.perf_counter_ns()
             sync_err = xnvme.xnvme_file_sync(op.handle)
+            if profiler._active:
+                profiler.add_event(
+                    "storage_kvcache.single.file_sync",
+                    "fs",
+                    sync_start_ns,
+                    time.perf_counter_ns() - sync_start_ns,
+                )
             if sync_err:
                 self._close_file_io(op)
                 raise IOError(f"xnvme_file_sync() failed for {op.path}")
         self._close_file_io(op)
+        if profiler._active:
+            profiler.add_event(
+                "storage_kvcache.single.poll_file_io_complete",
+                "fs",
+                poll_start_ns,
+                time.perf_counter_ns() - poll_start_ns,
+                args={"write": op.write},
+            )
         return _TimedIoResult(start_ns=op.start_ns, duration_ns=duration_ns)
 
     def _close_file_io(self, op: _QueuedFileIo) -> None:
@@ -411,9 +460,12 @@ class SingleThreadedXNvmeOffloadingHandler(OffloadingHandler):
             return
         op.closed = True
         if op.ctx:
-            xnvme.xnvme_queue_put_cmd_ctx(op.queue, op.ctx)
-        xnvme.xnvme_queue_term(op.queue)
-        xnvme.xnvme_file_close(op.handle)
+            with profile_scope("storage_kvcache.single.queue_put_ctx", "fs"):
+                xnvme.xnvme_queue_put_cmd_ctx(op.queue, op.ctx)
+        with profile_scope("storage_kvcache.single.queue_term", "fs"):
+            xnvme.xnvme_queue_term(op.queue)
+        with profile_scope("storage_kvcache.single.file_close", "fs"):
+            xnvme.xnvme_file_close(op.handle)
 
     def _launch_swap_blocks(
         self,
@@ -468,11 +520,16 @@ class SingleThreadedXNvmeOffloadingHandler(OffloadingHandler):
         dst_blocks: np.ndarray,
         dst_block_size_factor: int,
     ) -> torch.Tensor:
-        output = self._mapping_buffers[slot_index]
-        mapping_length = _build_block_mapping(
-            src_blocks, src_block_size_factor, dst_blocks, dst_block_size_factor, output
-        )
-        return self._mapping_tensors[slot_index][:mapping_length]
+        with profile_scope(
+            "storage_kvcache.single.build_block_mapping",
+            "kv_offload",
+            args={"src_blocks": int(src_blocks.size), "dst_blocks": int(dst_blocks.size)},
+        ):
+            output = self._mapping_buffers[slot_index]
+            mapping_length = _build_block_mapping(
+                src_blocks, src_block_size_factor, dst_blocks, dst_block_size_factor, output
+            )
+            return self._mapping_tensors[slot_index][:mapping_length]
 
     def _split_block_ids_for_files(
         self, block_ids: np.ndarray, file_count: int, first_block_index: int = 0
@@ -511,13 +568,14 @@ class SingleThreadedXNvmeOffloadingHandler(OffloadingHandler):
         return int(dst_spec.block_indices[0])
 
     def _pump_once(self) -> bool:
-        made_progress = self._activate_pending_jobs()
-        made_progress = self._drain_cuda_copies() or made_progress
-        made_progress = self._poll_file_ios() or made_progress
-        made_progress = self._submit_ready_writes() or made_progress
-        made_progress = self._schedule_new_work() or made_progress
-        made_progress = self._finish_completed_jobs() or made_progress
-        return made_progress
+        with profile_scope("storage_kvcache.single.pump_once", "kv_offload"):
+            made_progress = self._activate_pending_jobs()
+            made_progress = self._drain_cuda_copies() or made_progress
+            made_progress = self._poll_file_ios() or made_progress
+            made_progress = self._submit_ready_writes() or made_progress
+            made_progress = self._schedule_new_work() or made_progress
+            made_progress = self._finish_completed_jobs() or made_progress
+            return made_progress
 
     def _drain_cuda_copies(self) -> bool:
         made_progress = False
@@ -560,11 +618,16 @@ class SingleThreadedXNvmeOffloadingHandler(OffloadingHandler):
         file_index: int,
         op: _QueuedFileIo,
     ) -> None:
-        self.layout.unpack_storage_slot(
-            op.buffer.array[: self.file_store.payload_size],
-            self._staging_tensors,
-            slot_index,
-        )
+        with profile_scope(
+            "storage_kvcache.single.unpack_storage_slot",
+            "kv_offload",
+            args={"payload_size": self.file_store.payload_size},
+        ):
+            self.layout.unpack_storage_slot(
+                op.buffer.array[: self.file_store.payload_size],
+                self._staging_tensors,
+                slot_index,
+            )
         src_to_dst = self._build_block_mapping(
             slot_index,
             self._slot_block_ids[slot_index],
@@ -588,14 +651,16 @@ class SingleThreadedXNvmeOffloadingHandler(OffloadingHandler):
         self, slot_index: int, job: _ActiveTransferJob, op: _QueuedFileIo
     ) -> None:
         try:
-            os.link(op.temp_path, op.final_path)  # type: ignore[arg-type]
+            with profile_scope("storage_kvcache.single.link_temp", "fs"):
+                os.link(op.temp_path, op.final_path)  # type: ignore[arg-type]
             if self.file_store.config.sync_on_store and op.parent_path:
                 job.parent_paths.append(op.parent_path)
         except FileExistsError:
             pass
         finally:
             try:
-                os.unlink(op.temp_path)  # type: ignore[arg-type]
+                with profile_scope("storage_kvcache.single.unlink_temp", "fs"):
+                    os.unlink(op.temp_path)  # type: ignore[arg-type]
             except FileNotFoundError:
                 pass
         self._free_slots.append(slot_index)
@@ -689,20 +754,41 @@ class SingleThreadedXNvmeOffloadingHandler(OffloadingHandler):
     ) -> None:
         final_path = self.file_mapper.get_file_name(job.block_hashes[file_index])
         start_ns = time.perf_counter_ns()
-        if os.path.exists(final_path):
+        exists_start_ns = time.perf_counter_ns()
+        exists = os.path.exists(final_path)
+        if profiler._active:
+            profiler.add_event(
+                "storage_kvcache.single.store_exists",
+                "fs",
+                exists_start_ns,
+                time.perf_counter_ns() - exists_start_ns,
+                args={"exists": exists},
+            )
+        if exists:
             job.file_io_samples.append((start_ns, time.perf_counter_ns() - start_ns, 0))
             self._free_slots.append(slot_index)
             return
         parent = os.path.dirname(final_path)
-        os.makedirs(parent, exist_ok=True)
+        with profile_scope("storage_kvcache.single.makedirs", "fs"):
+            os.makedirs(parent, exist_ok=True)
         temp_path = self.file_store._temp_path(final_path)
         buffer = self._io_buffers[slot_index]
-        buffer.array.fill(0)
-        self.layout.pack_storage_slot_into(
-            self._staging_tensors,
-            slot_index,
-            buffer.array[: self.file_store.payload_size],
-        )
+        with profile_scope(
+            "storage_kvcache.single.zero_buffer",
+            "fs",
+            args={"io_size": self.file_store.io_size},
+        ):
+            buffer.array.fill(0)
+        with profile_scope(
+            "storage_kvcache.single.pack_storage_slot",
+            "kv_offload",
+            args={"payload_size": self.file_store.payload_size},
+        ):
+            self.layout.pack_storage_slot_into(
+                self._staging_tensors,
+                slot_index,
+                buffer.array[: self.file_store.payload_size],
+            )
         self._inflight_file_ios[slot_index] = (
             job.job_id,
             file_index,
@@ -726,7 +812,12 @@ class SingleThreadedXNvmeOffloadingHandler(OffloadingHandler):
             if self._job_has_inflight_work(job_id):
                 continue
             if job.parent_paths:
-                self.file_store.fsync_dirs(job.parent_paths)
+                with profile_scope(
+                    "storage_kvcache.single.fsync_parent_dirs",
+                    "fs",
+                    args={"num_dirs": len(set(job.parent_paths))},
+                ):
+                    self.file_store.fsync_dirs(job.parent_paths)
             transfer_size = job.total_file_count * self.layout.storage_block_bytes
             completed = _InstrumentedTransferResult(
                 result=TransferResult(
@@ -863,10 +954,19 @@ class SingleThreadedXNvmeOffloadingHandler(OffloadingHandler):
         self._profiled_jobs.add(job_id)
 
     def get_finished(self) -> list[TransferResult]:
+        poll_start_ns = time.perf_counter_ns()
         self._drain_completion_queue()
         results: list[TransferResult] = []
         completed_items = list(self._completion_cache.items())
         self._completion_cache.clear()
+        if profiler._active:
+            profiler.add_event(
+                "storage_kvcache.single.get_finished_poll",
+                "kv_offload",
+                poll_start_ns,
+                time.perf_counter_ns() - poll_start_ns,
+                args={"num_finished": len(completed_items)},
+            )
         for job_id, completed in completed_items:
             item = completed.item
             try:
