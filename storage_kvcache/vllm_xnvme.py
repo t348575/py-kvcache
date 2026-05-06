@@ -278,6 +278,26 @@ class ParsedKvLayout:
             )
             offset += expected_nbytes
 
+    def direct_storage_slot_view(
+        self,
+        staging_tensors: list[torch.Tensor],
+        slot_index: int,
+        *,
+        alignment: int,
+    ) -> np.ndarray[Any, np.dtype[np.uint8]] | None:
+        """Return a contiguous staging slot that can be used as an IO buffer."""
+        if len(staging_tensors) != 1:
+            return None
+
+        start = slot_index * self.storage_block_size_factor
+        end = start + self.storage_block_size_factor
+        view = self._byte_array_view(staging_tensors[0][start:end])
+        if view.nbytes != self.storage_block_bytes:
+            return None
+        if alignment > 0 and view.ctypes.data % alignment != 0:
+            return None
+        return view
+
 
 class XNvmeOffloadingSpec(OffloadingSpec):
     def __init__(self, vllm_config: VllmConfig, kv_cache_config: KVCacheConfig):

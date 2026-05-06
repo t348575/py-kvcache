@@ -156,6 +156,18 @@ class _TimedStoreResult:
     parent_path: str | None = None
 
 
+@dataclass
+class _QueuedRead:
+    user_data: int
+    fd: int
+    path: str
+    slot_index: int
+    start_ns: int
+    buffer: _AlignedIoBuffer | None
+    target: np.ndarray[Any, np.dtype[np.uint8]]
+    consumer: Callable[[int, np.ndarray[Any, np.dtype[np.uint8]]], None] | None
+
+
 def _align_up(value: int, alignment: int) -> int:
     if alignment <= 0:
         raise ValueError("alignment must be positive")
@@ -525,6 +537,134 @@ class LiburingFileStore:
             return existing
         return buffer
 
+    def read_paths_into(
+        self,
+        paths: list[str],
+        slot_indexes: list[int],
+        consumer: Callable[[int, np.ndarray[Any, np.dtype[np.uint8]]], None],
+        *,
+        direct_targets: list[np.ndarray[Any, np.dtype[np.uint8]] | None] | None = None,
+    ) -> list[tuple[int, _TimedIoResult]]:
+        if len(paths) != len(slot_indexes):
+            raise ValueError("paths and slot_indexes must have the same length")
+        if direct_targets is not None and len(direct_targets) != len(paths):
+            raise ValueError("direct_targets and paths must have the same length")
+        if not paths:
+            return []
+
+        completed: list[tuple[int, _TimedIoResult]] = []
+        queued = self.queue_read_paths(
+            paths,
+            slot_indexes,
+            consumer,
+            direct_targets=direct_targets,
+        )
+        try:
+            while queued:
+                item = self.poll_queued_read(queued)
+                if item is None:
+                    continue
+                completed.append(item)
+        finally:
+            self.close_queued_reads(queued)
+
+        return completed
+
+    def queue_read_paths(
+        self,
+        paths: list[str],
+        slot_indexes: list[int],
+        consumer: Callable[[int, np.ndarray[Any, np.dtype[np.uint8]]], None],
+        *,
+        direct_targets: list[np.ndarray[Any, np.dtype[np.uint8]] | None] | None = None,
+    ) -> dict[int, _QueuedRead]:
+        if len(paths) != len(slot_indexes):
+            raise ValueError("paths and slot_indexes must have the same length")
+        if direct_targets is not None and len(direct_targets) != len(paths):
+            raise ValueError("direct_targets and paths must have the same length")
+        if len(paths) > self.uring_depth:
+            raise ValueError("read batch is larger than uring_depth")
+        ring = self._get_thread_ring()
+        queued: dict[int, _QueuedRead] = {}
+        try:
+            for index, (path, slot_index) in enumerate(zip(paths, slot_indexes)):
+                direct_target = direct_targets[index] if direct_targets is not None else None
+                if direct_target is not None:
+                    if direct_target.nbytes < self.io_size:
+                        raise ValueError("direct target is smaller than aligned IO size")
+                    if direct_target.ctypes.data % self.config.io_alignment != 0:
+                        raise ValueError("direct target is not aligned for direct IO")
+                    target = direct_target
+                    buffer = None
+                    read_consumer = None
+                else:
+                    buffer = self._allocate_buffer()
+                    target = buffer.array
+                    read_consumer = consumer
+
+                fd = self.open_fd(path, write=False, create=False, truncate=False)
+                user_data = self._next_thread_user_data()
+                start_ns = time.perf_counter_ns()
+                ring.queue_rw(
+                    user_data=user_data,
+                    fd=fd,
+                    ptr=ctypes.c_void_p(target.ctypes.data),
+                    nbytes=self.io_size,
+                    write=False,
+                )
+                queued[user_data] = _QueuedRead(
+                    user_data=user_data,
+                    fd=fd,
+                    path=path,
+                    slot_index=slot_index,
+                    start_ns=start_ns,
+                    buffer=buffer,
+                    target=target,
+                    consumer=read_consumer,
+                )
+            ring.submit_pending()
+            return queued
+        except Exception:
+            self.close_queued_reads(queued)
+            raise
+
+    def poll_queued_read(
+        self, queued: dict[int, _QueuedRead]
+    ) -> tuple[int, _TimedIoResult] | None:
+        completion = self._get_thread_ring().poll_any()
+        if completion is None:
+            return None
+        user_data, result_nbytes = completion
+        item = queued.pop(user_data, None)
+        if item is None:
+            return None
+
+        duration_ns = time.perf_counter_ns() - item.start_ns
+        try:
+            if result_nbytes < 0:
+                raise OSError(-result_nbytes, f"io_uring read failed for {item.path}")
+            if result_nbytes != self.io_size:
+                raise IOError(
+                    f"io_uring read transferred {result_nbytes} bytes for {item.path}, expected {self.io_size}"
+                )
+            if item.consumer is not None:
+                item.consumer(item.slot_index, item.target[: self.payload_size])
+            return item.slot_index, _TimedIoResult(
+                start_ns=item.start_ns,
+                duration_ns=duration_ns,
+            )
+        finally:
+            os.close(item.fd)
+            if item.buffer is not None:
+                _LIBC.free(item.buffer.ptr)
+
+    def close_queued_reads(self, queued: dict[int, _QueuedRead]) -> None:
+        for item in queued.values():
+            os.close(item.fd)
+            if item.buffer is not None:
+                _LIBC.free(item.buffer.ptr)
+        queued.clear()
+
     def _get_thread_ring(self) -> LiburingRing:
         thread_id = threading.get_ident()
         with self._buffers_lock:
@@ -532,7 +672,7 @@ class LiburingFileStore:
             if ring is not None:
                 return ring
 
-        ring = LiburingRing(1)
+        ring = LiburingRing(self.uring_depth)
         with self._buffers_lock:
             existing = self._rings_by_thread.setdefault(thread_id, ring)
         if existing is not ring:
