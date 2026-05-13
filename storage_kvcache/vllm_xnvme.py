@@ -376,6 +376,13 @@ class XNvmeOffloadingSpec(OffloadingSpec):
                     self.shared_file_config,
                     payload_size=layout.storage_block_bytes,
                 )
+            elif engine_name == "kvikio":
+                from .kvikio_file import KvikioFileStore
+
+                file_store = KvikioFileStore(
+                    self.shared_file_config,
+                    payload_size=layout.storage_block_bytes,
+                )
             else:
                 file_store = XNvmeFileStore(
                     self.shared_file_config,
