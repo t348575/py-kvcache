@@ -54,6 +54,7 @@ _IORING_OFF_SQES = 0x10000000
 
 _IORING_OP_READ = 22
 _IORING_OP_WRITE = 23
+_IOSQE_ASYNC = 1 << 4
 
 
 def _syscall_numbers() -> tuple[int, int]:
@@ -234,6 +235,8 @@ class LiburingRing:
         sqe = self._sqes[index]
         ctypes.memset(ctypes.byref(sqe), 0, ctypes.sizeof(_IoUringSqe))
         sqe.opcode = _IORING_OP_WRITE if write else _IORING_OP_READ
+        if not write:
+            sqe.flags = _IOSQE_ASYNC
         sqe.fd = fd
         sqe.off = 0
         sqe.addr = int(ptr.value or 0)
