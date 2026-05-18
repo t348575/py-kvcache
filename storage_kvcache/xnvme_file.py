@@ -127,18 +127,6 @@ class XNvmeFileStore:
         consumer(slot_index, buffer.array[: self.payload_size])
         return _TimedIoResult(start_ns=start_ns, duration_ns=duration_ns)
 
-    def read_path_into_buffer(
-        self,
-        path: str,
-        buffer: _AlignedIoBuffer,
-    ) -> _TimedIoResult:
-        start_ns = time.perf_counter_ns()
-        self._read_file(path, buffer)
-        return _TimedIoResult(
-            start_ns=start_ns,
-            duration_ns=time.perf_counter_ns() - start_ns,
-        )
-
     def allocate_buffers(self, count: int) -> list[_AlignedIoBuffer]:
         return [self._allocate_buffer() for _ in range(count)]
 

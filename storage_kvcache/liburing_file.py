@@ -12,6 +12,7 @@ from dataclasses import dataclass
 from typing import Any
 
 import numpy as np
+from simple_profiler import profile_scope
 from vllm.logger import init_logger
 
 from .fs_config import SharedFileConfig
@@ -225,57 +226,68 @@ class LiburingRing:
         nbytes: int,
         write: bool,
     ) -> None:
-        head = int(self._sq_head[0])
-        tail = int(self._sq_tail[0])
-        if tail - head >= self._params.sq_entries:
-            raise BlockingIOError(errno.EAGAIN, "io_uring submission queue is full")
+        with profile_scope(
+            "uring.queue_rw",
+            "storage_kvcache",
+            args={"write": write, "nbytes": nbytes},
+        ):
+            head = int(self._sq_head[0])
+            tail = int(self._sq_tail[0])
+            if tail - head >= self._params.sq_entries:
+                raise BlockingIOError(errno.EAGAIN, "io_uring submission queue is full")
 
-        index = tail & int(self._sq_mask[0])
-        sqe = self._sqes[index]
-        ctypes.memset(ctypes.byref(sqe), 0, ctypes.sizeof(_IoUringSqe))
-        sqe.opcode = _IORING_OP_WRITE if write else _IORING_OP_READ
-        sqe.fd = fd
-        sqe.off = 0
-        sqe.addr = int(ptr.value or 0)
-        sqe.len = nbytes
-        sqe.user_data = user_data
-        self._sq_array[index] = index
-        self._sq_tail[0] = tail + 1
-        self._pending_submit += 1
+            index = tail & int(self._sq_mask[0])
+            sqe = self._sqes[index]
+            ctypes.memset(ctypes.byref(sqe), 0, ctypes.sizeof(_IoUringSqe))
+            sqe.opcode = _IORING_OP_WRITE if write else _IORING_OP_READ
+            sqe.fd = fd
+            sqe.off = 0
+            sqe.addr = int(ptr.value or 0)
+            sqe.len = nbytes
+            sqe.user_data = user_data
+            self._sq_array[index] = index
+            self._sq_tail[0] = tail + 1
+            self._pending_submit += 1
 
     def submit_pending(self) -> None:
-        if self._pending_submit == 0:
-            return
+        with profile_scope(
+            "uring.submit_pending",
+            "storage_kvcache",
+            args={"pending": self._pending_submit},
+        ):
+            if self._pending_submit == 0:
+                return
 
-        submitted = _LIBC.syscall(
-            ctypes.c_long(_NR_IO_URING_ENTER),
-            ctypes.c_int(self.fd),
-            ctypes.c_uint32(self._pending_submit),
-            ctypes.c_uint32(0),
-            ctypes.c_uint32(0),
-            ctypes.c_void_p(0),
-            ctypes.c_size_t(0),
-        )
-        if submitted < 0:
-            err = ctypes.get_errno()
-            raise OSError(err, "io_uring_enter(submit) failed")
-        self._pending_submit = max(0, self._pending_submit - int(submitted))
+            submitted = _LIBC.syscall(
+                ctypes.c_long(_NR_IO_URING_ENTER),
+                ctypes.c_int(self.fd),
+                ctypes.c_uint32(self._pending_submit),
+                ctypes.c_uint32(0),
+                ctypes.c_uint32(0),
+                ctypes.c_void_p(0),
+                ctypes.c_size_t(0),
+            )
+            if submitted < 0:
+                err = ctypes.get_errno()
+                raise OSError(err, "io_uring_enter(submit) failed")
+            self._pending_submit = max(0, self._pending_submit - int(submitted))
 
     def poll_any(self) -> tuple[int, int] | None:
-        if self._completed:
-            user_data, result = self._completed.popitem()
+        with profile_scope("uring.poll_any", "storage_kvcache"):
+            if self._completed:
+                user_data, result = self._completed.popitem()
+                return user_data, result
+
+            if int(self._cq_head[0]) == int(self._cq_tail[0]):
+                return None
+
+            head = int(self._cq_head[0])
+            index = head & int(self._cq_mask[0])
+            cqe = self._cqes[index]
+            user_data = int(cqe.user_data)
+            result = int(cqe.res)
+            self._cq_head[0] = head + 1
             return user_data, result
-
-        if int(self._cq_head[0]) == int(self._cq_tail[0]):
-            return None
-
-        head = int(self._cq_head[0])
-        index = head & int(self._cq_mask[0])
-        cqe = self._cqes[index]
-        user_data = int(cqe.user_data)
-        result = int(cqe.res)
-        self._cq_head[0] = head + 1
-        return user_data, result
 
     def submit_rw(self, **kwargs: object) -> None:
         self.queue_rw(**kwargs)
@@ -421,28 +433,20 @@ class LiburingFileStore:
         return f"{final_path}.tmp-{unique_suffix}"
 
     def open_fd(self, path: str, *, write: bool, create: bool, truncate: bool) -> int:
-        flags = os.O_WRONLY if write else os.O_RDONLY
-        if create:
-            flags |= os.O_CREAT
-        if truncate:
-            flags |= os.O_TRUNC
-        if self.config.direct:
-            flags |= getattr(os, "O_DIRECT", 0)
-        mode = self.config.create_mode if self.config.create_mode is not None else 0o666
-        return os.open(path, flags, mode)
-
-    def read_path_into(
-        self,
-        path: str,
-        slot_index: int,
-        consumer: Callable[[int, np.ndarray[Any, np.dtype[np.uint8]]], None],
-    ) -> _TimedIoResult:
-        start_ns = time.perf_counter_ns()
-        buffer = self._get_thread_buffer()
-        self._read_file(path, buffer)
-        duration_ns = time.perf_counter_ns() - start_ns
-        consumer(slot_index, buffer.array[: self.payload_size])
-        return _TimedIoResult(start_ns=start_ns, duration_ns=duration_ns)
+        with profile_scope(
+            "open_fd",
+            "storage_kvcache",
+            args={"write": write, "create": create, "truncate": truncate},
+        ):
+            flags = os.O_WRONLY if write else os.O_RDONLY
+            if create:
+                flags |= os.O_CREAT
+            if truncate:
+                flags |= os.O_TRUNC
+            if self.config.direct:
+                flags |= getattr(os, "O_DIRECT", 0)
+            mode = self.config.create_mode if self.config.create_mode is not None else 0o666
+            return os.open(path, flags, mode)
 
     def store_slot_if_missing(
         self,
@@ -452,7 +456,9 @@ class LiburingFileStore:
     ) -> _TimedStoreResult:
         parent_path: str | None = None
         start_ns = time.perf_counter_ns()
-        if os.path.exists(path):
+        with profile_scope("publish_exists_check", "storage_kvcache"):
+            already_exists = os.path.exists(path)
+        if already_exists:
             return _TimedStoreResult(
                 stored=False,
                 start_ns=start_ns,
@@ -460,7 +466,8 @@ class LiburingFileStore:
             )
 
         parent = os.path.dirname(path)
-        os.makedirs(parent, exist_ok=True)
+        with profile_scope("publish_makedirs", "storage_kvcache"):
+            os.makedirs(parent, exist_ok=True)
         temp_path = self._temp_path(path)
         buffer = self._get_thread_buffer()
         buffer.array.fill(0)
@@ -469,14 +476,16 @@ class LiburingFileStore:
         try:
             fd = self.open_fd(temp_path, write=True, create=True, truncate=True)
             try:
-                self._run_file_io(fd, buffer, path=temp_path, write=True)
+                self._run_file_io(fd, buffer, path=temp_path)
                 if self.config.sync_on_store:
-                    os.fsync(fd)
+                    with profile_scope("publish_fsync", "storage_kvcache"):
+                        os.fsync(fd)
             finally:
                 os.close(fd)
 
             try:
-                os.link(temp_path, path)
+                with profile_scope("publish_link", "storage_kvcache"):
+                    os.link(temp_path, path)
                 if self.config.sync_on_store:
                     parent_path = parent
                 return _TimedStoreResult(
@@ -493,82 +502,39 @@ class LiburingFileStore:
                 )
         finally:
             try:
-                os.unlink(temp_path)
+                with profile_scope("publish_unlink", "storage_kvcache"):
+                    os.unlink(temp_path)
             except FileNotFoundError:
                 pass
 
-    def _read_file(self, path: str, buffer: _AlignedIoBuffer) -> None:
-        fd = self.open_fd(path, write=False, create=False, truncate=False)
-        try:
-            self._run_file_io(fd, buffer, path=path, write=False)
-        finally:
-            os.close(fd)
-
-    def _run_file_io(
-        self, fd: int, buffer: _AlignedIoBuffer, *, path: str, write: bool
-    ) -> None:
+    def _run_file_io(self, fd: int, buffer: _AlignedIoBuffer, *, path: str) -> None:
         payload = memoryview(buffer.array)
-        if write:
+        with profile_scope(
+            "write_actual", "storage_kvcache", args={"nbytes": self.io_size}
+        ):
             result_nbytes = os.pwritev(fd, [payload], 0)
-        else:
-            result_nbytes = os.preadv(fd, [payload], 0)
         if result_nbytes < 0:
-            raise OSError(
-                -result_nbytes, f"preadv/pwritev {'write' if write else 'read'} failed for {path}"
-            )
+            raise OSError(-result_nbytes, f"pwritev write failed for {path}")
         if result_nbytes != self.io_size:
-            op_name = "write" if write else "read"
             raise IOError(
-                f"preadv/pwritev {op_name} transferred {result_nbytes} bytes for {path}, expected {self.io_size}"
+                f"pwritev write transferred {result_nbytes} bytes for {path}, expected {self.io_size}"
             )
 
     def _get_thread_buffer(self) -> _AlignedIoBuffer:
-        thread_id = threading.get_ident()
-        with self._buffers_lock:
-            buffer = self._buffers_by_thread.get(thread_id)
-            if buffer is not None:
-                return buffer
+        with profile_scope("get_thread_buffer", "storage_kvcache"):
+            thread_id = threading.get_ident()
+            with self._buffers_lock:
+                buffer = self._buffers_by_thread.get(thread_id)
+                if buffer is not None:
+                    return buffer
 
-        buffer = self._allocate_buffer()
-        with self._buffers_lock:
-            existing = self._buffers_by_thread.setdefault(thread_id, buffer)
-        if existing is not buffer:
-            _LIBC.free(buffer.ptr)
-            return existing
-        return buffer
-
-    def read_paths_into(
-        self,
-        paths: list[str],
-        slot_indexes: list[int],
-        consumer: Callable[[int, np.ndarray[Any, np.dtype[np.uint8]]], None],
-        *,
-        direct_targets: list[np.ndarray[Any, np.dtype[np.uint8]] | None] | None = None,
-    ) -> list[tuple[int, _TimedIoResult]]:
-        if len(paths) != len(slot_indexes):
-            raise ValueError("paths and slot_indexes must have the same length")
-        if direct_targets is not None and len(direct_targets) != len(paths):
-            raise ValueError("direct_targets and paths must have the same length")
-        if not paths:
-            return []
-
-        completed: list[tuple[int, _TimedIoResult]] = []
-        queued = self.queue_read_paths(
-            paths,
-            slot_indexes,
-            consumer,
-            direct_targets=direct_targets,
-        )
-        try:
-            while queued:
-                item = self.poll_queued_read(queued)
-                if item is None:
-                    continue
-                completed.append(item)
-        finally:
-            self.close_queued_reads(queued)
-
-        return completed
+            buffer = self._allocate_buffer()
+            with self._buffers_lock:
+                existing = self._buffers_by_thread.setdefault(thread_id, buffer)
+            if existing is not buffer:
+                _LIBC.free(buffer.ptr)
+                return existing
+            return buffer
 
     def queue_read_paths(
         self,
@@ -578,114 +544,152 @@ class LiburingFileStore:
         *,
         direct_targets: list[np.ndarray[Any, np.dtype[np.uint8]] | None] | None = None,
     ) -> dict[int, _QueuedRead]:
-        if len(paths) != len(slot_indexes):
-            raise ValueError("paths and slot_indexes must have the same length")
-        if direct_targets is not None and len(direct_targets) != len(paths):
-            raise ValueError("direct_targets and paths must have the same length")
-        if len(paths) > self.uring_depth:
-            raise ValueError("read batch is larger than uring_depth")
-        ring = self._get_thread_ring()
-        queued: dict[int, _QueuedRead] = {}
-        try:
-            for index, (path, slot_index) in enumerate(zip(paths, slot_indexes)):
-                direct_target = direct_targets[index] if direct_targets is not None else None
-                if direct_target is not None:
-                    if direct_target.nbytes < self.io_size:
-                        raise ValueError("direct target is smaller than aligned IO size")
-                    if direct_target.ctypes.data % self.config.io_alignment != 0:
-                        raise ValueError("direct target is not aligned for direct IO")
-                    target = direct_target
-                    buffer = None
-                    read_consumer = None
-                else:
-                    buffer = self._allocate_buffer()
-                    target = buffer.array
-                    read_consumer = consumer
+        with profile_scope(
+            "queue_read_paths", "storage_kvcache", args={"count": len(paths)}
+        ):
+            if len(paths) != len(slot_indexes):
+                raise ValueError("paths and slot_indexes must have the same length")
+            if direct_targets is not None and len(direct_targets) != len(paths):
+                raise ValueError("direct_targets and paths must have the same length")
+            if len(paths) > self.uring_depth:
+                raise ValueError("read batch is larger than uring_depth")
+            ring = self._get_thread_ring()
+            queued: dict[int, _QueuedRead] = {}
+            try:
+                for index, (path, slot_index) in enumerate(zip(paths, slot_indexes)):
+                    direct_target = direct_targets[index] if direct_targets is not None else None
+                    if direct_target is not None:
+                        if direct_target.nbytes < self.io_size:
+                            raise ValueError("direct target is smaller than aligned IO size")
+                        if direct_target.ctypes.data % self.config.io_alignment != 0:
+                            raise ValueError("direct target is not aligned for direct IO")
+                        target = direct_target
+                        buffer = None
+                        read_consumer = None
+                        with profile_scope(
+                            "read_path_direct",
+                            "storage_kvcache",
+                            args={"slot": slot_index},
+                        ):
+                            pass
+                    else:
+                        with profile_scope(
+                            "allocate_read_buffer",
+                            "storage_kvcache",
+                            args={"slot": slot_index},
+                        ):
+                            buffer = self._allocate_buffer()
+                        target = buffer.array
+                        read_consumer = consumer
+                        with profile_scope(
+                            "read_path_consumer",
+                            "storage_kvcache",
+                            args={"slot": slot_index},
+                        ):
+                            pass
 
-                fd = self.open_fd(path, write=False, create=False, truncate=False)
-                user_data = self._next_thread_user_data()
-                start_ns = time.perf_counter_ns()
-                ring.queue_rw(
-                    user_data=user_data,
-                    fd=fd,
-                    ptr=ctypes.c_void_p(target.ctypes.data),
-                    nbytes=self.io_size,
-                    write=False,
-                )
-                queued[user_data] = _QueuedRead(
-                    user_data=user_data,
-                    fd=fd,
-                    path=path,
-                    slot_index=slot_index,
-                    start_ns=start_ns,
-                    buffer=buffer,
-                    target=target,
-                    consumer=read_consumer,
-                )
-            ring.submit_pending()
-            return queued
-        except Exception:
-            self.close_queued_reads(queued)
-            raise
+                    fd = self.open_fd(path, write=False, create=False, truncate=False)
+                    user_data = self._next_thread_user_data()
+                    start_ns = time.perf_counter_ns()
+                    ring.queue_rw(
+                        user_data=user_data,
+                        fd=fd,
+                        ptr=ctypes.c_void_p(target.ctypes.data),
+                        nbytes=self.io_size,
+                        write=False,
+                    )
+                    queued[user_data] = _QueuedRead(
+                        user_data=user_data,
+                        fd=fd,
+                        path=path,
+                        slot_index=slot_index,
+                        start_ns=start_ns,
+                        buffer=buffer,
+                        target=target,
+                        consumer=read_consumer,
+                    )
+                ring.submit_pending()
+                return queued
+            except Exception:
+                self.close_queued_reads(queued)
+                raise
 
     def poll_queued_read(
         self, queued: dict[int, _QueuedRead]
     ) -> tuple[int, _TimedIoResult] | None:
-        completion = self._get_thread_ring().poll_any()
-        if completion is None:
-            return None
-        user_data, result_nbytes = completion
-        item = queued.pop(user_data, None)
-        if item is None:
-            return None
+        with profile_scope(
+            "poll_queued_read", "storage_kvcache", args={"queued": len(queued)}
+        ):
+            completion = self._get_thread_ring().poll_any()
+            if completion is None:
+                return None
+            user_data, result_nbytes = completion
+            item = queued.pop(user_data, None)
+            if item is None:
+                return None
 
-        duration_ns = time.perf_counter_ns() - item.start_ns
-        try:
-            if result_nbytes < 0:
-                raise OSError(-result_nbytes, f"io_uring read failed for {item.path}")
-            if result_nbytes != self.io_size:
-                raise IOError(
-                    f"io_uring read transferred {result_nbytes} bytes for {item.path}, expected {self.io_size}"
+            duration_ns = time.perf_counter_ns() - item.start_ns
+            try:
+                if result_nbytes < 0:
+                    raise OSError(-result_nbytes, f"io_uring read failed for {item.path}")
+                if result_nbytes != self.io_size:
+                    raise IOError(
+                        f"io_uring read transferred {result_nbytes} bytes for {item.path}, expected {self.io_size}"
+                    )
+                if item.consumer is not None:
+                    with profile_scope(
+                        "read_consumer_call",
+                        "storage_kvcache",
+                        args={"slot": item.slot_index},
+                    ):
+                        item.consumer(item.slot_index, item.target[: self.payload_size])
+                return item.slot_index, _TimedIoResult(
+                    start_ns=item.start_ns,
+                    duration_ns=duration_ns,
                 )
-            if item.consumer is not None:
-                item.consumer(item.slot_index, item.target[: self.payload_size])
-            return item.slot_index, _TimedIoResult(
-                start_ns=item.start_ns,
-                duration_ns=duration_ns,
-            )
-        finally:
-            os.close(item.fd)
-            if item.buffer is not None:
-                _LIBC.free(item.buffer.ptr)
+            finally:
+                with profile_scope(
+                    "close_completed_read",
+                    "storage_kvcache",
+                    args={"slot": item.slot_index},
+                ):
+                    os.close(item.fd)
+                    if item.buffer is not None:
+                        _LIBC.free(item.buffer.ptr)
 
     def close_queued_reads(self, queued: dict[int, _QueuedRead]) -> None:
-        for item in queued.values():
-            os.close(item.fd)
-            if item.buffer is not None:
-                _LIBC.free(item.buffer.ptr)
-        queued.clear()
+        with profile_scope(
+            "close_queued_reads", "storage_kvcache", args={"queued": len(queued)}
+        ):
+            for item in queued.values():
+                os.close(item.fd)
+                if item.buffer is not None:
+                    _LIBC.free(item.buffer.ptr)
+            queued.clear()
 
     def _get_thread_ring(self) -> LiburingRing:
-        thread_id = threading.get_ident()
-        with self._buffers_lock:
-            ring = self._rings_by_thread.get(thread_id)
-            if ring is not None:
-                return ring
+        with profile_scope("get_thread_ring", "storage_kvcache"):
+            thread_id = threading.get_ident()
+            with self._buffers_lock:
+                ring = self._rings_by_thread.get(thread_id)
+                if ring is not None:
+                    return ring
 
-        ring = LiburingRing(self.uring_depth)
-        with self._buffers_lock:
-            existing = self._rings_by_thread.setdefault(thread_id, ring)
-        if existing is not ring:
-            ring.close()
-            return existing
-        return ring
+            ring = LiburingRing(self.uring_depth)
+            with self._buffers_lock:
+                existing = self._rings_by_thread.setdefault(thread_id, ring)
+            if existing is not ring:
+                ring.close()
+                return existing
+            return ring
 
     def _next_thread_user_data(self) -> int:
-        thread_id = threading.get_ident()
-        with self._buffers_lock:
-            user_data = self._thread_user_data.get(thread_id, 0) + 1
-            self._thread_user_data[thread_id] = user_data
-        return user_data
+        with profile_scope("next_thread_user_data", "storage_kvcache"):
+            thread_id = threading.get_ident()
+            with self._buffers_lock:
+                user_data = self._thread_user_data.get(thread_id, 0) + 1
+                self._thread_user_data[thread_id] = user_data
+            return user_data
 
     def _fsync_dir(self, path: str) -> None:
         try:

@@ -4,7 +4,6 @@ import threading
 import time
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass
-from functools import partial
 from typing import Any
 
 import numpy as np
@@ -18,7 +17,7 @@ from vllm.v1.kv_offload.worker.worker import (
     TransferSpec,
 )
 
-from simple_profiler import profiler
+from simple_profiler import profile_category, profile_scope, profiler
 
 from ..file_mapper import FileMapper
 from ..vllm_xnvme import (
@@ -114,39 +113,50 @@ class MultithreadedXNvmeOffloadingHandler(OffloadingHandler):
         profile_tid: str = "kv_transfer",
         req_id: str = "",
     ) -> bool:
-        src_spec, dst_spec = spec
-        if isinstance(src_spec, GPULoadStoreSpec) and isinstance(
-            dst_spec, SharedStorageLoadStoreSpec
+        with profile_scope(
+            "transfer_async", "storage_kvcache", args={"job_id": job_id}
         ):
-            direction = "gpu_to_storage"
-            if profile_tid == "kv_transfer":
-                profile_tid = "kv_store"
-        elif isinstance(src_spec, SharedStorageLoadStoreSpec) and isinstance(
-            dst_spec, GPULoadStoreSpec
-        ):
-            direction = "storage_to_gpu"
-            if profile_tid == "kv_transfer":
-                profile_tid = "kv_load"
-        else:
-            raise TypeError(
-                f"unsupported transfer spec: {type(src_spec)!r} -> {type(dst_spec)!r}"
-            )
+            src_spec, dst_spec = spec
+            if isinstance(src_spec, GPULoadStoreSpec) and isinstance(
+                dst_spec, SharedStorageLoadStoreSpec
+            ):
+                direction = "gpu_to_storage"
+                if profile_tid == "kv_transfer":
+                    profile_tid = "kv_store"
+            elif isinstance(src_spec, SharedStorageLoadStoreSpec) and isinstance(
+                dst_spec, GPULoadStoreSpec
+            ):
+                direction = "storage_to_gpu"
+                if profile_tid == "kv_transfer":
+                    profile_tid = "kv_load"
+            else:
+                raise TypeError(
+                    f"unsupported transfer spec: {type(src_spec)!r} -> {type(dst_spec)!r}"
+                )
 
-        with self._lock:
-            if job_id in self._futures:
-                raise ValueError(f"job {job_id} is already active")
-            self._transfer_jobs[job_id] = (
-                time.perf_counter_ns(),
-                profile_tid,
-                req_id,
-                direction,
-            )
-            self._futures[job_id] = self._executor.submit(
-                self._run_transfer, job_id, spec
-            )
-        return True
+            with self._lock:
+                if job_id in self._futures:
+                    raise ValueError(f"job {job_id} is already active")
+                self._transfer_jobs[job_id] = (
+                    time.perf_counter_ns(),
+                    profile_tid,
+                    req_id,
+                    direction,
+                )
+                self._futures[job_id] = self._executor.submit(
+                    self._run_transfer, job_id, spec
+                )
+            return True
 
     def _run_transfer(
+        self, job_id: int, spec: TransferSpec
+    ) -> _InstrumentedTransferResult:
+        with profile_scope(
+            "run_transfer", "storage_kvcache", args={"job_id": job_id}
+        ):
+            return self._run_transfer_unprofiled(job_id, spec)
+
+    def _run_transfer_unprofiled(
         self, job_id: int, spec: TransferSpec
     ) -> _InstrumentedTransferResult:
         started = time.perf_counter()
@@ -198,65 +208,71 @@ class MultithreadedXNvmeOffloadingHandler(OffloadingHandler):
         src_to_dst: torch.Tensor,
         sample_num_bytes: int,
     ) -> _PendingCudaCopy:
-        sample_start_ns = time.perf_counter_ns()
-        stream = self._swap_streams[slot_index]
-        start_event = torch.cuda.Event(enable_timing=True)
-        end_event = torch.cuda.Event(enable_timing=True)
-        with torch.cuda.stream(stream):
-            start_event.record(stream)
-            mapping_len = int(src_to_dst.shape[0])
-            if mapping_len > 0 and hasattr(ops, "swap_blocks_batch"):
-                mapping = self._mapping_buffers[slot_index][:mapping_len]
-                src_ptrs = self._batch_src_ptrs[slot_index]
-                dst_ptrs = self._batch_dst_ptrs[slot_index]
-                sizes = self._batch_sizes[slot_index]
-                offset = 0
-                for src_tensor, dst_tensor, block_bytes in zip(
-                    src_tensors,
-                    dst_tensors,
-                    self.layout.bytes_per_kernel_block,
-                ):
-                    end = offset + mapping_len
-                    src_ptrs[offset:end] = src_tensor.data_ptr() + mapping[:, 0] * block_bytes
-                    dst_ptrs[offset:end] = dst_tensor.data_ptr() + mapping[:, 1] * block_bytes
-                    sizes[offset:end] = block_bytes
-                    offset = end
-                ops.swap_blocks_batch(
-                    self._batch_src_tensors[slot_index][:offset],
-                    self._batch_dst_tensors[slot_index][:offset],
-                    self._batch_size_tensors[slot_index][:offset],
-                )
-            else:
-                for src_tensor, dst_tensor, block_bytes in zip(
-                    src_tensors,
-                    dst_tensors,
-                    self.layout.bytes_per_kernel_block,
-                ):
-                    ops.swap_blocks(src_tensor, dst_tensor, block_bytes, src_to_dst)
-            end_event.record(stream)
-        return _PendingCudaCopy(
-            slot_index=slot_index,
-            start_ns=sample_start_ns,
-            start_event=start_event,
-            end_event=end_event,
-            sample_num_bytes=sample_num_bytes,
-        )
+        with profile_scope(
+            "launch_swap_blocks", "storage_kvcache", args={"slot": slot_index}
+        ):
+            sample_start_ns = time.perf_counter_ns()
+            stream = self._swap_streams[slot_index]
+            start_event = torch.cuda.Event(enable_timing=True)
+            end_event = torch.cuda.Event(enable_timing=True)
+            with torch.cuda.stream(stream):
+                start_event.record(stream)
+                mapping_len = int(src_to_dst.shape[0])
+                if mapping_len > 0 and hasattr(ops, "swap_blocks_batch"):
+                    mapping = self._mapping_buffers[slot_index][:mapping_len]
+                    src_ptrs = self._batch_src_ptrs[slot_index]
+                    dst_ptrs = self._batch_dst_ptrs[slot_index]
+                    sizes = self._batch_sizes[slot_index]
+                    offset = 0
+                    for src_tensor, dst_tensor, block_bytes in zip(
+                        src_tensors,
+                        dst_tensors,
+                        self.layout.bytes_per_kernel_block,
+                    ):
+                        end = offset + mapping_len
+                        src_ptrs[offset:end] = src_tensor.data_ptr() + mapping[:, 0] * block_bytes
+                        dst_ptrs[offset:end] = dst_tensor.data_ptr() + mapping[:, 1] * block_bytes
+                        sizes[offset:end] = block_bytes
+                        offset = end
+                    ops.swap_blocks_batch(
+                        self._batch_src_tensors[slot_index][:offset],
+                        self._batch_dst_tensors[slot_index][:offset],
+                        self._batch_size_tensors[slot_index][:offset],
+                    )
+                else:
+                    for src_tensor, dst_tensor, block_bytes in zip(
+                        src_tensors,
+                        dst_tensors,
+                        self.layout.bytes_per_kernel_block,
+                    ):
+                        ops.swap_blocks(src_tensor, dst_tensor, block_bytes, src_to_dst)
+                end_event.record(stream)
+            return _PendingCudaCopy(
+                slot_index=slot_index,
+                start_ns=sample_start_ns,
+                start_event=start_event,
+                end_event=end_event,
+                sample_num_bytes=sample_num_bytes,
+            )
 
     @staticmethod
     def _complete_cuda_copy(
         pending: _PendingCudaCopy, cuda_copy_samples: list[Sample]
     ) -> None:
-        pending.end_event.synchronize()
-        duration_ns = int(
-            pending.start_event.elapsed_time(pending.end_event) * 1_000_000
-        )
-        cuda_copy_samples.append(
-            (
-                pending.start_ns,
-                duration_ns,
-                pending.sample_num_bytes,
+        with profile_scope(
+            "complete_cuda_copy", "storage_kvcache", args={"slot": pending.slot_index}
+        ):
+            pending.end_event.synchronize()
+            duration_ns = int(
+                pending.start_event.elapsed_time(pending.end_event) * 1_000_000
             )
-        )
+            cuda_copy_samples.append(
+                (
+                    pending.start_ns,
+                    duration_ns,
+                    pending.sample_num_bytes,
+                )
+            )
 
     @staticmethod
     def _cuda_copy_done(pending: _PendingCudaCopy) -> bool:
@@ -270,16 +286,36 @@ class MultithreadedXNvmeOffloadingHandler(OffloadingHandler):
         dst_blocks: np.ndarray,
         dst_block_size_factor: int,
     ) -> torch.Tensor:
-        output = self._mapping_buffers[slot_index]
-        mapping_length = _build_block_mapping(
-            src_blocks, src_block_size_factor, dst_blocks, dst_block_size_factor, output
-        )
-        return self._mapping_tensors[slot_index][:mapping_length]
+        with profile_scope(
+            "build_block_mapping", "storage_kvcache", args={"slot": slot_index}
+        ):
+            output = self._mapping_buffers[slot_index]
+            mapping_length = _build_block_mapping(
+                src_blocks, src_block_size_factor, dst_blocks, dst_block_size_factor, output
+            )
+            return self._mapping_tensors[slot_index][:mapping_length]
 
     def _unpack_storage_slot_from_payload(
         self, slot_index: int, payload: np.ndarray
     ) -> None:
-        self.layout.unpack_storage_slot(payload, self._staging_tensors, slot_index)
+        with profile_scope(
+            "unpack_storage_slot",
+            "storage_kvcache",
+            args={"slot": slot_index},
+        ):
+            self.layout.unpack_storage_slot(payload, self._staging_tensors, slot_index)
+
+    def _pack_storage_slot_for_payload(
+        self, slot_index: int, payload: np.ndarray
+    ) -> None:
+        with profile_scope(
+            "pack_storage_slot",
+            "storage_kvcache",
+            args={"slot": slot_index},
+        ):
+            self.layout.pack_storage_slot_into(
+                self._staging_tensors, slot_index, payload
+            )
 
     def _load_slot(
         self,
@@ -287,60 +323,72 @@ class MultithreadedXNvmeOffloadingHandler(OffloadingHandler):
         block_hash: bytes,
         dst_blocks: np.ndarray,
     ) -> tuple[int, _TimedIoResult, _PendingCudaCopy]:
-        result = self.file_store.read_path_into(
-            self.file_mapper.get_file_name(block_hash),
-            slot_index,
-            self._unpack_storage_slot_from_payload,
-        )
-        src_to_dst = self._build_block_mapping(
-            slot_index,
-            self._slot_block_ids[slot_index],
-            self.layout.storage_block_size_factor,
-            dst_blocks,
-            self.layout.gpu_block_size_factor,
-        )
-        pending_copy = self._launch_swap_blocks(
-            slot_index,
-            self._staging_tensors,
-            self.layout.gpu_tensors,
-            src_to_dst,
-            self.layout.storage_block_bytes,
-        )
-        return slot_index, result, pending_copy
+        with profile_scope(
+            "load_slot", "storage_kvcache", args={"slot": slot_index}
+        ):
+            result = self.file_store.read_path_into(
+                self.file_mapper.get_file_name(block_hash),
+                slot_index,
+                self._unpack_storage_slot_from_payload,
+            )
+            src_to_dst = self._build_block_mapping(
+                slot_index,
+                self._slot_block_ids[slot_index],
+                self.layout.storage_block_size_factor,
+                dst_blocks,
+                self.layout.gpu_block_size_factor,
+            )
+            pending_copy = self._launch_swap_blocks(
+                slot_index,
+                self._staging_tensors,
+                self.layout.gpu_tensors,
+                src_to_dst,
+                self.layout.storage_block_bytes,
+            )
+            return slot_index, result, pending_copy
 
     def _store_slot(
         self,
         slot_index: int,
         block_hash: bytes,
     ) -> tuple[int, _TimedStoreResult]:
-        result = self.file_store.store_slot_if_missing(
-            self.file_mapper.get_file_name(block_hash),
-            slot_index,
-            partial(self.layout.pack_storage_slot_into, self._staging_tensors),
-        )
-        return slot_index, result
+        with profile_scope(
+            "store_slot", "storage_kvcache", args={"slot": slot_index}
+        ):
+            result = self.file_store.store_slot_if_missing(
+                self.file_mapper.get_file_name(block_hash),
+                slot_index,
+                self._pack_storage_slot_for_payload,
+            )
+            return slot_index, result
 
+    @profile_category("storage_kvcache")
     def _split_block_ids_for_files(
         self, block_ids: np.ndarray, file_count: int, first_block_index: int = 0
     ) -> list[np.ndarray]:
-        if file_count == 0:
-            return []
+        with profile_scope(
+            "split_block_ids_for_files",
+            "storage_kvcache",
+            args={"file_count": file_count},
+        ):
+            if file_count == 0:
+                return []
 
-        blocks_per_file = self.layout.gpu_blocks_per_storage_block
-        first_block_skip = first_block_index % blocks_per_file
-        first_size = min(len(block_ids), blocks_per_file - first_block_skip)
-        chunks: list[np.ndarray] = []
-        start = 0
-        size = first_size
-        for _ in range(file_count):
-            end = min(start + size, len(block_ids))
-            chunks.append(block_ids[start:end])
-            start = end
-            size = blocks_per_file
+            blocks_per_file = self.layout.gpu_blocks_per_storage_block
+            first_block_skip = first_block_index % blocks_per_file
+            first_size = min(len(block_ids), blocks_per_file - first_block_skip)
+            chunks: list[np.ndarray] = []
+            start = 0
+            size = first_size
+            for _ in range(file_count):
+                end = min(start + size, len(block_ids))
+                chunks.append(block_ids[start:end])
+                start = end
+                size = blocks_per_file
 
-        if start != len(block_ids):
-            raise ValueError("source and destination block counts do not line up")
-        return chunks
+            if start != len(block_ids):
+                raise ValueError("source and destination block counts do not line up")
+            return chunks
 
     @staticmethod
     def _get_first_group_block_index(dst_spec: GPULoadStoreSpec) -> int:
@@ -356,6 +404,7 @@ class MultithreadedXNvmeOffloadingHandler(OffloadingHandler):
             )
         return int(dst_spec.block_indices[0])
 
+    @profile_category("storage_kvcache")
     def _store(
         self,
         src_spec: GPULoadStoreSpec,
@@ -377,44 +426,59 @@ class MultithreadedXNvmeOffloadingHandler(OffloadingHandler):
         parent_paths: list[str] = []
 
         def launch_next_copy(slot_index: int) -> None:
-            nonlocal next_file_index
-            if next_file_index >= total_file_count:
-                return
-            file_index = next_file_index
-            src_blocks = src_blocks_per_file[next_file_index]
-            src_to_dst = self._build_block_mapping(
-                slot_index,
-                src_blocks,
-                self.layout.gpu_block_size_factor,
-                self._slot_block_ids[slot_index],
-                self.layout.storage_block_size_factor,
-            )
-            pending_copies[slot_index] = (
-                self._launch_swap_blocks(
+            with profile_scope(
+                "store.launch_next_copy",
+                "storage_kvcache",
+                args={"slot": slot_index},
+            ):
+                nonlocal next_file_index
+                if next_file_index >= total_file_count:
+                    return
+                file_index = next_file_index
+                src_blocks = src_blocks_per_file[next_file_index]
+                src_to_dst = self._build_block_mapping(
                     slot_index,
-                    self.layout.gpu_tensors,
-                    self._staging_tensors,
-                    src_to_dst,
-                    self.layout.storage_block_bytes,
-                ),
-                file_index,
-            )
-            next_file_index += 1
+                    src_blocks,
+                    self.layout.gpu_block_size_factor,
+                    self._slot_block_ids[slot_index],
+                    self.layout.storage_block_size_factor,
+                )
+                pending_copies[slot_index] = (
+                    self._launch_swap_blocks(
+                        slot_index,
+                        self.layout.gpu_tensors,
+                        self._staging_tensors,
+                        src_to_dst,
+                        self.layout.storage_block_bytes,
+                    ),
+                    file_index,
+                )
+                next_file_index += 1
 
         def submit_store(slot_index: int, file_index: int) -> None:
-            future = self._pipeline_executor.submit(
-                self._store_slot,
-                slot_index,
-                dst_spec.block_hashes[file_index],
-            )
-            inflight[future] = slot_index
+            with profile_scope(
+                "store.submit_store",
+                "storage_kvcache",
+                args={"slot": slot_index, "file_index": file_index},
+            ):
+                future = self._pipeline_executor.submit(
+                    self._store_slot,
+                    slot_index,
+                    dst_spec.block_hashes[file_index],
+                )
+                inflight[future] = slot_index
 
         def drain_ready_copies(*, force: bool = False) -> None:
-            for slot_index, (pending, file_index) in list(pending_copies.items()):
-                if force or self._cuda_copy_done(pending):
-                    self._complete_cuda_copy(pending, cuda_copy_samples)
-                    pending_copies.pop(slot_index)
-                    submit_store(slot_index, file_index)
+            with profile_scope(
+                "store.drain_ready_copies",
+                "storage_kvcache",
+                args={"force": force, "pending": len(pending_copies)},
+            ):
+                for slot_index, (pending, file_index) in list(pending_copies.items()):
+                    if force or self._cuda_copy_done(pending):
+                        self._complete_cuda_copy(pending, cuda_copy_samples)
+                        pending_copies.pop(slot_index)
+                        submit_store(slot_index, file_index)
 
         for slot_index in free_slots:
             launch_next_copy(slot_index)
@@ -446,6 +510,7 @@ class MultithreadedXNvmeOffloadingHandler(OffloadingHandler):
 
         return total_file_count * self.layout.storage_block_bytes
 
+    @profile_category("storage_kvcache")
     def _load(
         self,
         src_spec: SharedStorageLoadStoreSpec,
@@ -477,24 +542,34 @@ class MultithreadedXNvmeOffloadingHandler(OffloadingHandler):
         next_file_index = 0
 
         def submit_next(slot_index: int) -> None:
-            nonlocal next_file_index
-            if next_file_index >= total_file_count:
-                return
-            future = self._pipeline_executor.submit(
-                self._load_slot,
-                slot_index,
-                src_spec.block_hashes[next_file_index],
-                dst_blocks_per_file[next_file_index],
-            )
-            inflight[future] = slot_index
-            next_file_index += 1
+            with profile_scope(
+                "load.submit_next",
+                "storage_kvcache",
+                args={"slot": slot_index},
+            ):
+                nonlocal next_file_index
+                if next_file_index >= total_file_count:
+                    return
+                future = self._pipeline_executor.submit(
+                    self._load_slot,
+                    slot_index,
+                    src_spec.block_hashes[next_file_index],
+                    dst_blocks_per_file[next_file_index],
+                )
+                inflight[future] = slot_index
+                next_file_index += 1
 
         def drain_ready_copies(*, force: bool = False) -> None:
-            for slot_index, pending in list(pending_copies.items()):
-                if force or self._cuda_copy_done(pending):
-                    self._complete_cuda_copy(pending, cuda_copy_samples)
-                    pending_copies.pop(slot_index)
-                    submit_next(slot_index)
+            with profile_scope(
+                "load.drain_ready_copies",
+                "storage_kvcache",
+                args={"force": force, "pending": len(pending_copies)},
+            ):
+                for slot_index, pending in list(pending_copies.items()):
+                    if force or self._cuda_copy_done(pending):
+                        self._complete_cuda_copy(pending, cuda_copy_samples)
+                        pending_copies.pop(slot_index)
+                        submit_next(slot_index)
 
         for slot_index in free_slots:
             submit_next(slot_index)
@@ -525,6 +600,7 @@ class MultithreadedXNvmeOffloadingHandler(OffloadingHandler):
 
         return total_file_count * self.layout.storage_block_bytes
 
+    @profile_category("storage_kvcache")
     def _load_batched_io_uring(
         self,
         src_spec: SharedStorageLoadStoreSpec,
@@ -557,49 +633,59 @@ class MultithreadedXNvmeOffloadingHandler(OffloadingHandler):
         next_file_index = 0
 
         def submit_ready_reads() -> None:
-            nonlocal next_file_index
-            if not free_slots or next_file_index >= total_file_count:
-                return
-            available = max_queued_reads - len(queued_reads)
-            if available <= 0:
-                return
+            with profile_scope(
+                "load_batched.submit_ready_reads",
+                "storage_kvcache",
+                args={"free_slots": len(free_slots), "queued": len(queued_reads)},
+            ):
+                nonlocal next_file_index
+                if not free_slots or next_file_index >= total_file_count:
+                    return
+                available = max_queued_reads - len(queued_reads)
+                if available <= 0:
+                    return
 
-            paths: list[str] = []
-            slot_indexes: list[int] = []
-            direct_targets: list[np.ndarray[Any, np.dtype[np.uint8]] | None] = []
-            while free_slots and available > 0 and next_file_index < total_file_count:
-                slot_index = free_slots.pop()
-                block_hash = src_spec.block_hashes[next_file_index]
-                slot_to_dst_blocks[slot_index] = dst_blocks_per_file[next_file_index]
-                paths.append(self.file_mapper.get_file_name(block_hash))
-                slot_indexes.append(slot_index)
-                direct_target = None
-                if self.file_store.io_size == self.layout.storage_block_bytes:
-                    direct_target = self.layout.direct_storage_slot_view(
-                        self._staging_tensors,
-                        slot_index,
-                        alignment=self.file_store.config.io_alignment,
-                    )
-                direct_targets.append(direct_target)
-                next_file_index += 1
-                available -= 1
+                paths: list[str] = []
+                slot_indexes: list[int] = []
+                direct_targets: list[np.ndarray[Any, np.dtype[np.uint8]] | None] = []
+                while free_slots and available > 0 and next_file_index < total_file_count:
+                    slot_index = free_slots.pop()
+                    block_hash = src_spec.block_hashes[next_file_index]
+                    slot_to_dst_blocks[slot_index] = dst_blocks_per_file[next_file_index]
+                    paths.append(self.file_mapper.get_file_name(block_hash))
+                    slot_indexes.append(slot_index)
+                    direct_target = None
+                    if self.file_store.io_size == self.layout.storage_block_bytes:
+                        direct_target = self.layout.direct_storage_slot_view(
+                            self._staging_tensors,
+                            slot_index,
+                            alignment=self.file_store.config.io_alignment,
+                        )
+                    direct_targets.append(direct_target)
+                    next_file_index += 1
+                    available -= 1
 
-            if paths:
-                queued_reads.update(
-                    self.file_store.queue_read_paths(
-                        paths,
-                        slot_indexes,
-                        self._unpack_storage_slot_from_payload,
-                        direct_targets=direct_targets,
+                if paths:
+                    queued_reads.update(
+                        self.file_store.queue_read_paths(
+                            paths,
+                            slot_indexes,
+                            self._unpack_storage_slot_from_payload,
+                            direct_targets=direct_targets,
+                        )
                     )
-                )
 
         def drain_ready_copies(*, force: bool = False) -> None:
-            for slot_index, pending in list(pending_copies.items()):
-                if force or self._cuda_copy_done(pending):
-                    self._complete_cuda_copy(pending, cuda_copy_samples)
-                    pending_copies.pop(slot_index)
-                    free_slots.append(slot_index)
+            with profile_scope(
+                "load_batched.drain_ready_copies",
+                "storage_kvcache",
+                args={"force": force, "pending": len(pending_copies)},
+            ):
+                for slot_index, pending in list(pending_copies.items()):
+                    if force or self._cuda_copy_done(pending):
+                        self._complete_cuda_copy(pending, cuda_copy_samples)
+                        pending_copies.pop(slot_index)
+                        free_slots.append(slot_index)
 
         try:
             submit_ready_reads()
@@ -619,6 +705,7 @@ class MultithreadedXNvmeOffloadingHandler(OffloadingHandler):
                     continue
 
                 slot_index, result = completed_read
+                load_slot_start_ns = result.start_ns
                 file_io_samples.append(
                     (
                         result.start_ns,
@@ -641,11 +728,19 @@ class MultithreadedXNvmeOffloadingHandler(OffloadingHandler):
                     src_to_dst,
                     self.layout.storage_block_bytes,
                 )
+                profiler.add_event(
+                    name="load_slot",
+                    category="storage_kvcache",
+                    start_ns=load_slot_start_ns,
+                    duration_ns=time.perf_counter_ns() - load_slot_start_ns,
+                    args={"slot": slot_index},
+                )
         finally:
             self.file_store.close_queued_reads(queued_reads)
 
         return total_file_count * self.layout.storage_block_bytes
 
+    @profile_category("storage_kvcache")
     def _emit_profile_events(
         self, job_id: int, instrumented_result: _InstrumentedTransferResult, end_ns: int
     ) -> None:
@@ -754,6 +849,7 @@ class MultithreadedXNvmeOffloadingHandler(OffloadingHandler):
             )
         self._profiled_jobs.add(job_id)
 
+    @profile_category("storage_kvcache")
     def get_finished(self) -> list[TransferResult]:
         with self._lock:
             finished_items = [
@@ -782,6 +878,7 @@ class MultithreadedXNvmeOffloadingHandler(OffloadingHandler):
                     self._futures.pop(job_id, None)
         return results
 
+    @profile_category("storage_kvcache")
     def wait(self, job_ids: set[int]) -> None:
         with self._lock:
             futures = {
@@ -795,6 +892,7 @@ class MultithreadedXNvmeOffloadingHandler(OffloadingHandler):
                 job_id, instrumented_result, time.perf_counter_ns()
             )
 
+    @profile_category("storage_kvcache")
     def shutdown(self) -> None:
         self._executor.shutdown(wait=True)
         self._pipeline_executor.shutdown(wait=True)

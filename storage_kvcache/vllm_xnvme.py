@@ -25,6 +25,15 @@ from vllm.v1.kv_offload.worker.worker import OffloadingHandler
 
 from simple_profiler import profiler
 
+
+def _maybe_start_profiler_session() -> None:
+    if getattr(profiler, "_active", False):
+        return
+    profiler.begin_session(
+        f"pyoffload-{os.getpid()}.json", merge_output="merge.json"
+    )
+
+
 from .file_mapper import FileMapper
 from .fs_config import SharedFileConfig
 from .xnvme_file import XNvmeFileStore
@@ -303,6 +312,7 @@ class XNvmeOffloadingSpec(OffloadingSpec):
     def __init__(self, vllm_config: VllmConfig, kv_cache_config: KVCacheConfig):
         super().__init__(vllm_config, kv_cache_config)
 
+        _maybe_start_profiler_session()
         self.shared_file_config = SharedFileConfig.from_extra_config(self.extra_config)
         self._manager: OffloadingManager | None = None
         self._handler: OffloadingHandler | None = None
