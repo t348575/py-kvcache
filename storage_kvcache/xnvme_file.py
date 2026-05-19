@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from typing import Any
 
 import numpy as np
+from simple_profiler import profile_scope, profiler
 from vllm.logger import init_logger
 import xnvme.ctypes_bindings as xnvme_bindings
 import xnvme.ctypes_bindings.api as xnvme
@@ -121,10 +122,21 @@ class XNvmeFileStore:
         consumer: Callable[[int, np.ndarray[Any, np.dtype[np.uint8]]], None],
     ) -> _TimedIoResult:
         start_ns = time.perf_counter_ns()
-        buffer = self._get_thread_buffer()
-        self._read_file(path, buffer)
+        with profile_scope("storage_kvcache.xnvme.get_thread_buffer", "fs"):
+            buffer = self._get_thread_buffer()
+        with profile_scope(
+            "storage_kvcache.xnvme.read_file_total",
+            "fs",
+            args={"io_size": self.io_size, "payload_size": self.payload_size},
+        ):
+            self._read_file(path, buffer)
         duration_ns = time.perf_counter_ns() - start_ns
-        consumer(slot_index, buffer.array[: self.payload_size])
+        with profile_scope(
+            "storage_kvcache.xnvme.read_consumer_unpack",
+            "fs",
+            args={"payload_size": self.payload_size},
+        ):
+            consumer(slot_index, buffer.array[: self.payload_size])
         return _TimedIoResult(start_ns=start_ns, duration_ns=duration_ns)
 
     def read_path_into_buffer(
@@ -133,14 +145,24 @@ class XNvmeFileStore:
         buffer: _AlignedIoBuffer,
     ) -> _TimedIoResult:
         start_ns = time.perf_counter_ns()
-        self._read_file(path, buffer)
+        with profile_scope(
+            "storage_kvcache.xnvme.read_file_total",
+            "fs",
+            args={"io_size": self.io_size, "payload_size": self.payload_size},
+        ):
+            self._read_file(path, buffer)
         return _TimedIoResult(
             start_ns=start_ns,
             duration_ns=time.perf_counter_ns() - start_ns,
         )
 
     def allocate_buffers(self, count: int) -> list[_AlignedIoBuffer]:
-        return [self._allocate_buffer() for _ in range(count)]
+        with profile_scope(
+            "storage_kvcache.xnvme.allocate_buffers",
+            "fs",
+            args={"count": count, "io_size": self.io_size},
+        ):
+            return [self._allocate_buffer() for _ in range(count)]
 
     def free_buffers(self, buffers: Sequence[_AlignedIoBuffer]) -> None:
         for buffer in buffers:
@@ -157,16 +179,26 @@ class XNvmeFileStore:
         if not self.config.sync_on_store:
             return
         for path in set(paths):
-            self._fsync_dir(path)
+            with profile_scope("storage_kvcache.xnvme.fsync_dir", "fs"):
+                self._fsync_dir(path)
 
     def _read_file(self, path: str, buffer: _AlignedIoBuffer) -> None:
-        with self._open_file(path, create=False, truncate=False, write=False) as handle:
-            result_nbytes = self._run_queued_file_io(
-                handle,
-                buffer,
-                path=path,
-                write=False,
+        with profile_scope("storage_kvcache.xnvme.open_read", "fs"):
+            handle_context = self._open_file(
+                path, create=False, truncate=False, write=False
             )
+        with handle_context as handle:
+            with profile_scope(
+                "storage_kvcache.xnvme.queued_read",
+                "fs",
+                args={"io_size": self.io_size},
+            ):
+                result_nbytes = self._run_queued_file_io(
+                    handle,
+                    buffer,
+                    path=path,
+                    write=False,
+                )
             if result_nbytes != self.io_size:
                 raise IOError(
                     f"xnvme_file_pread() transferred {result_nbytes} bytes for {path}, expected {self.io_size}"
@@ -180,7 +212,17 @@ class XNvmeFileStore:
     ) -> _TimedStoreResult:
         parent_path: str | None = None
         start_ns = time.perf_counter_ns()
-        if os.path.exists(path):
+        exists_start_ns = time.perf_counter_ns()
+        exists = os.path.exists(path)
+        if profiler._active:
+            profiler.add_event(
+                "storage_kvcache.xnvme.store_exists",
+                "fs",
+                exists_start_ns,
+                time.perf_counter_ns() - exists_start_ns,
+                args={"exists": exists},
+            )
+        if exists:
             return _TimedStoreResult(
                 stored=False,
                 start_ns=start_ns,
@@ -188,33 +230,61 @@ class XNvmeFileStore:
             )
 
         parent = os.path.dirname(path)
-        os.makedirs(parent, exist_ok=True)
+        with profile_scope("storage_kvcache.xnvme.makedirs", "fs"):
+            os.makedirs(parent, exist_ok=True)
         temp_path = self._temp_path(path)
-        buffer = self._get_thread_buffer()
-        buffer.array.fill(0)
-        producer(slot_index, buffer.array[: self.payload_size])
+        with profile_scope("storage_kvcache.xnvme.get_thread_buffer", "fs"):
+            buffer = self._get_thread_buffer()
+        with profile_scope(
+            "storage_kvcache.xnvme.zero_buffer",
+            "fs",
+            args={"io_size": self.io_size},
+        ):
+            buffer.array.fill(0)
+        with profile_scope(
+            "storage_kvcache.xnvme.store_producer_pack",
+            "fs",
+            args={"payload_size": self.payload_size},
+        ):
+            producer(slot_index, buffer.array[: self.payload_size])
 
         try:
-            with self._open_file(
-                temp_path, create=True, truncate=True, write=True
-            ) as handle:
-                result_nbytes = self._run_queued_file_io(
-                    handle,
-                    buffer,
-                    path=temp_path,
-                    write=True,
+            with profile_scope("storage_kvcache.xnvme.open_write", "fs"):
+                handle_context = self._open_file(
+                    temp_path, create=True, truncate=True, write=True
                 )
+            with handle_context as handle:
+                with profile_scope(
+                    "storage_kvcache.xnvme.queued_write",
+                    "fs",
+                    args={"io_size": self.io_size},
+                ):
+                    result_nbytes = self._run_queued_file_io(
+                        handle,
+                        buffer,
+                        path=temp_path,
+                        write=True,
+                    )
                 if result_nbytes != self.io_size:
                     raise IOError(
                         f"xnvme_file_pwrite() transferred {result_nbytes} bytes for {temp_path}, expected {self.io_size}"
                     )
                 if self.config.sync_on_store:
+                    sync_start_ns = time.perf_counter_ns()
                     sync_err = xnvme.xnvme_file_sync(handle)
+                    if profiler._active:
+                        profiler.add_event(
+                            "storage_kvcache.xnvme.file_sync",
+                            "fs",
+                            sync_start_ns,
+                            time.perf_counter_ns() - sync_start_ns,
+                        )
                     if sync_err:
                         raise IOError(f"xnvme_file_sync() failed for {temp_path}")
 
             try:
-                os.link(temp_path, path)
+                with profile_scope("storage_kvcache.xnvme.link_temp", "fs"):
+                    os.link(temp_path, path)
                 if self.config.sync_on_store:
                     parent_path = parent
                 return _TimedStoreResult(
@@ -231,7 +301,8 @@ class XNvmeFileStore:
                 )
         finally:
             try:
-                os.unlink(temp_path)
+                with profile_scope("storage_kvcache.xnvme.unlink_temp", "fs"):
+                    os.unlink(temp_path)
             except FileNotFoundError:
                 pass
 
@@ -244,31 +315,53 @@ class XNvmeFileStore:
         write: bool,
     ) -> int:
         queue = ctypes.POINTER(xnvme.xnvme_queue)()
-        queue_err = xnvme.xnvme_queue_init(handle, 1, 0, ctypes.byref(queue))
+        with profile_scope("storage_kvcache.xnvme.queue_init", "fs"):
+            queue_err = xnvme.xnvme_queue_init(handle, 1, 0, ctypes.byref(queue))
         if queue_err or not queue:
             op = "write" if write else "read"
             raise IOError(f"xnvme_queue_init() failed for {op} of {path}: {queue_err}")
 
         ctx = None
         try:
-            ctx = xnvme.xnvme_queue_get_cmd_ctx(queue)
+            with profile_scope("storage_kvcache.xnvme.queue_get_ctx", "fs"):
+                ctx = xnvme.xnvme_queue_get_cmd_ctx(queue)
             if not ctx:
                 raise IOError(f"xnvme_queue_get_cmd_ctx() failed for {path}")
 
             ptr = ctypes.cast(buffer.ptr, ctypes.POINTER(None))
+            submit_start_ns = time.perf_counter_ns()
             if write:
                 io_err = xnvme.xnvme_file_pwrite(ctx, ptr, self.io_size, 0)
                 op_name = "xnvme_file_pwrite"
             else:
                 io_err = xnvme.xnvme_file_pread(ctx, ptr, self.io_size, 0)
                 op_name = "xnvme_file_pread"
+            if profiler._active:
+                profiler.add_event(
+                    f"storage_kvcache.xnvme.{op_name}_submit",
+                    "fs",
+                    submit_start_ns,
+                    time.perf_counter_ns() - submit_start_ns,
+                    args={"io_size": self.io_size},
+                )
             if io_err:
                 raise IOError(f"{op_name}() submit failed for {path}: {io_err}")
 
+            poke_start_ns = time.perf_counter_ns()
+            poke_count = 0
             while xnvme.xnvme_queue_get_outstanding(queue):
+                poke_count += 1
                 poke_err = xnvme.xnvme_queue_poke(queue, 0)
                 if poke_err < 0:
                     raise IOError(f"xnvme_queue_poke() failed for {path}: {poke_err}")
+            if profiler._active:
+                profiler.add_event(
+                    "storage_kvcache.xnvme.queue_poke_until_done",
+                    "fs",
+                    poke_start_ns,
+                    time.perf_counter_ns() - poke_start_ns,
+                    args={"poke_count": poke_count, "io_size": self.io_size},
+                )
 
             result = ctx.contents
             if _xnvme_cmd_ctx_failed(result):
@@ -276,8 +369,10 @@ class XNvmeFileStore:
             return _xnvme_cmd_ctx_result(result)
         finally:
             if ctx:
-                xnvme.xnvme_queue_put_cmd_ctx(queue, ctx)
-            xnvme.xnvme_queue_term(queue)
+                with profile_scope("storage_kvcache.xnvme.queue_put_ctx", "fs"):
+                    xnvme.xnvme_queue_put_cmd_ctx(queue, ctx)
+            with profile_scope("storage_kvcache.xnvme.queue_term", "fs"):
+                xnvme.xnvme_queue_term(queue)
 
     def _get_thread_buffer(self) -> _AlignedIoBuffer:
         thread_id = threading.get_ident()
@@ -297,7 +392,12 @@ class XNvmeFileStore:
     def _allocate_buffer(self) -> _AlignedIoBuffer:
         alignment = max(self.config.io_alignment, ctypes.sizeof(ctypes.c_void_p))
         ptr = ctypes.c_void_p()
-        alloc_err = _LIBC.posix_memalign(ctypes.byref(ptr), alignment, self.io_size)
+        with profile_scope(
+            "storage_kvcache.xnvme.posix_memalign",
+            "fs",
+            args={"alignment": alignment, "io_size": self.io_size},
+        ):
+            alloc_err = _LIBC.posix_memalign(ctypes.byref(ptr), alignment, self.io_size)
         if alloc_err != 0 or not ptr.value:
             raise RuntimeError(f"posix_memalign() failed: {alloc_err}")
         array = np.ctypeslib.as_array(
@@ -391,9 +491,18 @@ class XNvmeFileStore:
         )
         uri_ref = ctypes.create_string_buffer(path.encode("utf-8"))
         string_refs.append(uri_ref)
+        open_start_ns = time.perf_counter_ns()
         handle = xnvme.xnvme_file_open(
             ctypes.cast(uri_ref, ctypes.POINTER(ctypes.c_char)), ctypes.byref(opts)
         )
+        if profiler._active:
+            profiler.add_event(
+                "storage_kvcache.xnvme.file_open",
+                "fs",
+                open_start_ns,
+                time.perf_counter_ns() - open_start_ns,
+                args={"write": write, "create": create, "truncate": truncate},
+            )
         if not handle:
             raise RuntimeError(
                 "xnvme_file_open() failed for "
@@ -408,7 +517,15 @@ class XNvmeFileStore:
                 return handle
 
             def __exit__(self_nonlocal, exc_type, exc, tb):
+                close_start_ns = time.perf_counter_ns()
                 xnvme.xnvme_file_close(handle)
+                if profiler._active:
+                    profiler.add_event(
+                        "storage_kvcache.xnvme.file_close",
+                        "fs",
+                        close_start_ns,
+                        time.perf_counter_ns() - close_start_ns,
+                    )
                 return False
 
         return _HandleContext()

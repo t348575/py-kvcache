@@ -10,6 +10,7 @@ from dataclasses import dataclass
 
 import numpy as np
 import torch
+from simple_profiler import profile_scope, profiler
 from vllm.logger import init_logger
 
 from ..file_mapper import FileMapper
@@ -126,23 +127,29 @@ class LiburingSingleThreadedOffloadingHandler(SingleThreadedXNvmeOffloadingHandl
         final_path: str | None = None,
         parent_path: str | None = None,
     ) -> _QueuedLiburingFileIo:
-        fd = self.file_store.open_fd(
-            path,
-            write=write,
-            create=create,
-            truncate=truncate,
-        )
+        with profile_scope("storage_kvcache.liburing_single.open_fd", "fs"):
+            fd = self.file_store.open_fd(
+                path,
+                write=write,
+                create=create,
+                truncate=truncate,
+            )
         user_data = self._next_user_data
         self._next_user_data += 1
         start_ns = time.perf_counter_ns()
         try:
-            self._ring.queue_rw(
-                user_data=user_data,
-                fd=fd,
-                ptr=buffer.ptr,
-                nbytes=self.file_store.io_size,
-                write=write,
-            )
+            with profile_scope(
+                "storage_kvcache.liburing_single.queue_rw",
+                "fs",
+                args={"io_size": self.file_store.io_size, "write": write},
+            ):
+                self._ring.queue_rw(
+                    user_data=user_data,
+                    fd=fd,
+                    ptr=buffer.ptr,
+                    nbytes=self.file_store.io_size,
+                    write=write,
+                )
         except BaseException:
             os.close(fd)
             raise
@@ -164,7 +171,8 @@ class LiburingSingleThreadedOffloadingHandler(SingleThreadedXNvmeOffloadingHandl
         made_progress = self._poll_file_ios() or made_progress
         made_progress = self._submit_ready_writes() or made_progress
         made_progress = self._schedule_new_work() or made_progress
-        self._ring.submit_pending()
+        with profile_scope("storage_kvcache.liburing_single.submit_pending", "fs"):
+            self._ring.submit_pending()
         made_progress = self._finish_completed_jobs() or made_progress
         return made_progress
 
@@ -189,8 +197,16 @@ class LiburingSingleThreadedOffloadingHandler(SingleThreadedXNvmeOffloadingHandl
     def _poll_file_io(
         self, op: _QueuedLiburingFileIo
     ) -> _TimedIoResult | None:
+        poll_start_ns = time.perf_counter_ns()
         result_nbytes = self._ring.poll(op.user_data)
         if result_nbytes is None:
+            if profiler._active:
+                profiler.add_event(
+                    "storage_kvcache.liburing_single.poll_pending",
+                    "fs",
+                    poll_start_ns,
+                    time.perf_counter_ns() - poll_start_ns,
+                )
             return None
         if result_nbytes < 0:
             self._close_file_io(op)
@@ -204,15 +220,25 @@ class LiburingSingleThreadedOffloadingHandler(SingleThreadedXNvmeOffloadingHandl
             )
         duration_ns = time.perf_counter_ns() - op.start_ns
         if op.write and self.file_store.config.sync_on_store:
-            os.fsync(op.fd)
+            with profile_scope("storage_kvcache.liburing_single.file_sync", "fs"):
+                os.fsync(op.fd)
         self._close_file_io(op)
+        if profiler._active:
+            profiler.add_event(
+                "storage_kvcache.liburing_single.poll_complete",
+                "fs",
+                poll_start_ns,
+                time.perf_counter_ns() - poll_start_ns,
+                args={"write": op.write},
+            )
         return _TimedIoResult(start_ns=op.start_ns, duration_ns=duration_ns)
 
     def _close_file_io(self, op: _QueuedLiburingFileIo) -> None:
         if op.closed:
             return
         op.closed = True
-        os.close(op.fd)
+        with profile_scope("storage_kvcache.liburing_single.close_fd", "fs"):
+            os.close(op.fd)
 
     def shutdown(self) -> None:
         self._submission_queue.put(None)

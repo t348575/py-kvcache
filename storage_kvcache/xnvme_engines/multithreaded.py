@@ -18,7 +18,7 @@ from vllm.v1.kv_offload.worker.worker import (
     TransferSpec,
 )
 
-from simple_profiler import profiler
+from simple_profiler import profile_scope, profiler
 
 from ..file_mapper import FileMapper
 from ..vllm_xnvme import (
@@ -162,9 +162,14 @@ class MultithreadedXNvmeOffloadingHandler(OffloadingHandler):
                 req_id,
                 direction,
             )
-            self._futures[job_id] = self._executor.submit(
-                self._run_transfer, job_id, spec
-            )
+            with profile_scope(
+                "storage_kvcache.engine.submit_transfer_future",
+                "kv_offload",
+                args={"job_id": job_id, "direction": direction},
+            ):
+                self._futures[job_id] = self._executor.submit(
+                    self._run_transfer, job_id, spec
+                )
         return True
 
     def prefetch_async(
@@ -341,9 +346,14 @@ class MultithreadedXNvmeOffloadingHandler(OffloadingHandler):
         if isinstance(src_spec, GPULoadStoreSpec) and isinstance(
             dst_spec, SharedStorageLoadStoreSpec
         ):
-            transfer_size = self._store(
-                src_spec, dst_spec, file_io_samples, cuda_copy_samples
-            )
+            with profile_scope(
+                "storage_kvcache.engine.store_total",
+                "kv_offload",
+                args={"job_id": job_id, "num_files": len(dst_spec.block_hashes)},
+            ):
+                transfer_size = self._store(
+                    src_spec, dst_spec, file_io_samples, cuda_copy_samples
+                )
             transfer_type = (
                 GPULoadStoreSpec.medium(),
                 SharedStorageLoadStoreSpec.medium(),
@@ -351,9 +361,14 @@ class MultithreadedXNvmeOffloadingHandler(OffloadingHandler):
         elif isinstance(src_spec, SharedStorageLoadStoreSpec) and isinstance(
             dst_spec, GPULoadStoreSpec
         ):
-            transfer_size = self._load(
-                src_spec, dst_spec, file_io_samples, cuda_copy_samples
-            )
+            with profile_scope(
+                "storage_kvcache.engine.load_total",
+                "kv_offload",
+                args={"job_id": job_id, "num_files": len(src_spec.block_hashes)},
+            ):
+                transfer_size = self._load(
+                    src_spec, dst_spec, file_io_samples, cuda_copy_samples
+                )
             transfer_type = (
                 SharedStorageLoadStoreSpec.medium(),
                 GPULoadStoreSpec.medium(),
@@ -548,16 +563,26 @@ class MultithreadedXNvmeOffloadingHandler(OffloadingHandler):
         dst_blocks: np.ndarray,
         dst_block_size_factor: int,
     ) -> torch.Tensor:
-        output = self._mapping_buffers[slot_index]
-        mapping_length = _build_block_mapping(
-            src_blocks, src_block_size_factor, dst_blocks, dst_block_size_factor, output
-        )
-        return self._mapping_tensors[slot_index][:mapping_length]
+        with profile_scope(
+            "storage_kvcache.engine.build_block_mapping",
+            "kv_offload",
+            args={"src_blocks": int(src_blocks.size), "dst_blocks": int(dst_blocks.size)},
+        ):
+            output = self._mapping_buffers[slot_index]
+            mapping_length = _build_block_mapping(
+                src_blocks, src_block_size_factor, dst_blocks, dst_block_size_factor, output
+            )
+            return self._mapping_tensors[slot_index][:mapping_length]
 
     def _unpack_storage_slot_from_payload(
         self, slot_index: int, payload: np.ndarray
     ) -> None:
-        self.layout.unpack_storage_slot(payload, self._staging_tensors, slot_index)
+        with profile_scope(
+            "storage_kvcache.engine.unpack_storage_slot",
+            "kv_offload",
+            args={"payload_size": len(payload)},
+        ):
+            self.layout.unpack_storage_slot(payload, self._staging_tensors, slot_index)
 
     def _prefetch_read(
         self, state: _PrefetchState, file_io_samples: list[Sample]
@@ -797,11 +822,14 @@ class MultithreadedXNvmeOffloadingHandler(OffloadingHandler):
         block_hash: bytes,
         dst_blocks: np.ndarray,
     ) -> tuple[int, _TimedIoResult, _PendingCudaCopy]:
-        result = self.file_store.read_path_into(
-            self.file_mapper.get_file_name(block_hash),
-            slot_index,
-            self._unpack_storage_slot_from_payload,
-        )
+        with profile_scope("storage_kvcache.engine.file_name", "kv_offload"):
+            file_name = self.file_mapper.get_file_name(block_hash)
+        with profile_scope("storage_kvcache.engine.read_slot_file", "kv_offload"):
+            result = self.file_store.read_path_into(
+                file_name,
+                slot_index,
+                self._unpack_storage_slot_from_payload,
+            )
         src_to_dst = self._build_block_mapping(
             slot_index,
             self._slot_block_ids[slot_index],
@@ -823,11 +851,14 @@ class MultithreadedXNvmeOffloadingHandler(OffloadingHandler):
         slot_index: int,
         block_hash: bytes,
     ) -> tuple[int, _TimedStoreResult]:
-        result = self.file_store.store_slot_if_missing(
-            self.file_mapper.get_file_name(block_hash),
-            slot_index,
-            partial(self.layout.pack_storage_slot_into, self._staging_tensors),
-        )
+        with profile_scope("storage_kvcache.engine.file_name", "kv_offload"):
+            file_name = self.file_mapper.get_file_name(block_hash)
+        with profile_scope("storage_kvcache.engine.store_slot_file", "kv_offload"):
+            result = self.file_store.store_slot_if_missing(
+                file_name,
+                slot_index,
+                partial(self.layout.pack_storage_slot_into, self._staging_tensors),
+            )
         return slot_index, result
 
     def _split_block_ids_for_files(
@@ -877,9 +908,14 @@ class MultithreadedXNvmeOffloadingHandler(OffloadingHandler):
         if total_file_count == 0:
             return 0
 
-        src_blocks_per_file = self._split_block_ids_for_files(
-            src_spec.block_ids, total_file_count
-        )
+        with profile_scope(
+            "storage_kvcache.engine.split_store_block_ids",
+            "kv_offload",
+            args={"num_blocks": int(src_spec.block_ids.size), "num_files": total_file_count},
+        ):
+            src_blocks_per_file = self._split_block_ids_for_files(
+                src_spec.block_ids, total_file_count
+            )
         free_slots = list(range(min(self.staging_slot_capacity, total_file_count)))
         inflight: dict[Future[tuple[int, _TimedStoreResult]], int] = {}
         pending_copies: dict[int, tuple[_PendingCudaCopy, int]] = {}
@@ -912,11 +948,16 @@ class MultithreadedXNvmeOffloadingHandler(OffloadingHandler):
             next_file_index += 1
 
         def submit_store(slot_index: int, file_index: int) -> None:
-            future = self._pipeline_executor.submit(
-                self._store_slot,
-                slot_index,
-                dst_spec.block_hashes[file_index],
-            )
+            with profile_scope(
+                "storage_kvcache.engine.submit_store_slot",
+                "kv_offload",
+                args={"file_index": file_index},
+            ):
+                future = self._pipeline_executor.submit(
+                    self._store_slot,
+                    slot_index,
+                    dst_spec.block_hashes[file_index],
+                )
             inflight[future] = slot_index
 
         def drain_ready_copies(*, force: bool = False) -> None:
@@ -952,7 +993,12 @@ class MultithreadedXNvmeOffloadingHandler(OffloadingHandler):
                 launch_next_copy(slot_index)
 
         if parent_paths:
-            self.file_store.fsync_dirs(parent_paths)
+            with profile_scope(
+                "storage_kvcache.engine.fsync_parent_dirs",
+                "fs",
+                args={"num_dirs": len(set(parent_paths))},
+            ):
+                self.file_store.fsync_dirs(parent_paths)
 
         return total_file_count * self.layout.storage_block_bytes
 
@@ -976,11 +1022,16 @@ class MultithreadedXNvmeOffloadingHandler(OffloadingHandler):
         if total_file_count == 0:
             return 0
 
-        dst_blocks_per_file = self._split_block_ids_for_files(
-            dst_spec.block_ids,
-            total_file_count,
-            self._get_first_group_block_index(dst_spec),
-        )
+        with profile_scope(
+            "storage_kvcache.engine.split_load_block_ids",
+            "kv_offload",
+            args={"num_blocks": int(dst_spec.block_ids.size), "num_files": total_file_count},
+        ):
+            dst_blocks_per_file = self._split_block_ids_for_files(
+                dst_spec.block_ids,
+                total_file_count,
+                self._get_first_group_block_index(dst_spec),
+            )
         free_slots = list(range(min(self.staging_slot_capacity, total_file_count)))
         inflight: dict[Future[tuple[int, _TimedIoResult, _PendingCudaCopy]], int] = {}
         pending_copies: dict[int, _PendingCudaCopy] = {}
@@ -990,12 +1041,17 @@ class MultithreadedXNvmeOffloadingHandler(OffloadingHandler):
             nonlocal next_file_index
             if next_file_index >= total_file_count:
                 return
-            future = self._pipeline_executor.submit(
-                self._load_slot,
-                slot_index,
-                src_spec.block_hashes[next_file_index],
-                dst_blocks_per_file[next_file_index],
-            )
+            with profile_scope(
+                "storage_kvcache.engine.submit_load_slot",
+                "kv_offload",
+                args={"file_index": next_file_index},
+            ):
+                future = self._pipeline_executor.submit(
+                    self._load_slot,
+                    slot_index,
+                    src_spec.block_hashes[next_file_index],
+                    dst_blocks_per_file[next_file_index],
+                )
             inflight[future] = slot_index
             next_file_index += 1
 
@@ -1212,12 +1268,21 @@ class MultithreadedXNvmeOffloadingHandler(OffloadingHandler):
         self._profiled_jobs.add(job_id)
 
     def get_finished(self) -> list[TransferResult]:
+        poll_start_ns = time.perf_counter_ns()
         with self._lock:
             finished_items = [
                 (job_id, future)
                 for job_id, future in self._futures.items()
                 if future.done()
             ]
+        if profiler._active:
+            profiler.add_event(
+                "storage_kvcache.engine.get_finished_poll",
+                "kv_offload",
+                poll_start_ns,
+                time.perf_counter_ns() - poll_start_ns,
+                args={"num_finished": len(finished_items)},
+            )
 
         results: list[TransferResult] = []
         for job_id, future in finished_items:

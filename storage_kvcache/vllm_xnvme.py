@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import time
 from collections.abc import Iterable, Iterator
 from dataclasses import dataclass
 
@@ -23,7 +24,7 @@ from vllm.v1.kv_offload.mediums import GPULoadStoreSpec
 from vllm.v1.kv_offload.spec import CanonicalKVCaches, OffloadingSpec
 from vllm.v1.kv_offload.worker.worker import OffloadingHandler
 
-from simple_profiler import profiler
+from simple_profiler import profile_scope, profiler
 
 from .file_mapper import FileMapper
 from .fs_config import SharedFileConfig
@@ -108,16 +109,50 @@ class SharedStorageOffloadingManager(OffloadingManager):
         return get_offload_block_hash(key)
 
     def lookup(self, keys: Iterable[OffloadKey]) -> int:
+        start_ns = time.perf_counter_ns()
         hit_count = 0
+        checked = 0
         for key in keys:
+            checked += 1
             block_hash = self._get_block_hash(key)
-            if not os.path.exists(self.file_mapper.get_file_name(block_hash)):
+            with profile_scope("storage_kvcache.manager.file_name", "kv_offload"):
+                file_name = self.file_mapper.get_file_name(block_hash)
+            exists_start_ns = time.perf_counter_ns()
+            exists = os.path.exists(file_name)
+            if profiler._active:
+                profiler.add_event(
+                    "storage_kvcache.manager.lookup_exists_one",
+                    "kv_offload",
+                    exists_start_ns,
+                    time.perf_counter_ns() - exists_start_ns,
+                    args={"hit": exists},
+                )
+            if not exists:
                 break
             hit_count += 1
+        if profiler._active:
+            profiler.add_event(
+                "storage_kvcache.manager.lookup",
+                "kv_offload",
+                start_ns,
+                time.perf_counter_ns() - start_ns,
+                args={"checked_keys": checked, "hit_count": hit_count},
+            )
         return hit_count
 
     def prepare_load(self, keys: Iterable[OffloadKey]) -> LoadStoreSpec:
-        return SharedStorageLoadStoreSpec(self._get_block_hash(key) for key in keys)
+        start_ns = time.perf_counter_ns()
+        block_hashes = [self._get_block_hash(key) for key in keys]
+        spec = SharedStorageLoadStoreSpec(block_hashes)
+        if profiler._active:
+            profiler.add_event(
+                "storage_kvcache.manager.prepare_load",
+                "kv_offload",
+                start_ns,
+                time.perf_counter_ns() - start_ns,
+                args={"num_keys": len(block_hashes)},
+            )
+        return spec
 
     def touch(self, keys: Iterable[OffloadKey]):
         return
@@ -126,14 +161,40 @@ class SharedStorageOffloadingManager(OffloadingManager):
         return
 
     def prepare_store(self, keys: Iterable[OffloadKey]) -> PrepareStoreOutput | None:
+        start_ns = time.perf_counter_ns()
         keys_to_store: list[OffloadKey] = []
         block_hashes_to_store: list[bytes] = []
+        checked = 0
         for key in keys:
+            checked += 1
             block_hash = self._get_block_hash(key)
-            if os.path.exists(self.file_mapper.get_file_name(block_hash)):
+            with profile_scope("storage_kvcache.manager.file_name", "kv_offload"):
+                file_name = self.file_mapper.get_file_name(block_hash)
+            exists_start_ns = time.perf_counter_ns()
+            exists = os.path.exists(file_name)
+            if profiler._active:
+                profiler.add_event(
+                    "storage_kvcache.manager.prepare_store_exists_one",
+                    "kv_offload",
+                    exists_start_ns,
+                    time.perf_counter_ns() - exists_start_ns,
+                    args={"exists": exists},
+                )
+            if exists:
                 continue
             keys_to_store.append(key)
             block_hashes_to_store.append(block_hash)
+        if profiler._active:
+            profiler.add_event(
+                "storage_kvcache.manager.prepare_store",
+                "kv_offload",
+                start_ns,
+                time.perf_counter_ns() - start_ns,
+                args={
+                    "checked_keys": checked,
+                    "keys_to_store": len(keys_to_store),
+                },
+            )
         return PrepareStoreOutput(
             keys_to_store=keys_to_store,
             store_spec=SharedStorageLoadStoreSpec(block_hashes_to_store),

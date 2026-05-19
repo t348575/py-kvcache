@@ -12,6 +12,7 @@ from dataclasses import dataclass
 from typing import Any
 
 import numpy as np
+from simple_profiler import profile_scope, profiler
 from vllm.logger import init_logger
 
 from .fs_config import SharedFileConfig
@@ -250,6 +251,8 @@ class LiburingRing:
         if self._pending_submit == 0:
             return
 
+        submit_start_ns = time.perf_counter_ns()
+        pending_submit = self._pending_submit
         submitted = _LIBC.syscall(
             ctypes.c_long(_NR_IO_URING_ENTER),
             ctypes.c_int(self.fd),
@@ -262,14 +265,37 @@ class LiburingRing:
         if submitted < 0:
             err = ctypes.get_errno()
             raise OSError(err, "io_uring_enter(submit) failed")
+        if profiler._active:
+            profiler.add_event(
+                "storage_kvcache.liburing.enter_submit",
+                "fs",
+                submit_start_ns,
+                time.perf_counter_ns() - submit_start_ns,
+                args={"pending": pending_submit, "submitted": int(submitted)},
+            )
         self._pending_submit = max(0, self._pending_submit - int(submitted))
 
     def poll_any(self) -> tuple[int, int] | None:
+        poll_start_ns = time.perf_counter_ns()
         if self._completed:
             user_data, result = self._completed.popitem()
+            if profiler._active:
+                profiler.add_event(
+                    "storage_kvcache.liburing.poll_any_cached",
+                    "fs",
+                    poll_start_ns,
+                    time.perf_counter_ns() - poll_start_ns,
+                )
             return user_data, result
 
         if int(self._cq_head[0]) == int(self._cq_tail[0]):
+            if profiler._active:
+                profiler.add_event(
+                    "storage_kvcache.liburing.poll_any_empty",
+                    "fs",
+                    poll_start_ns,
+                    time.perf_counter_ns() - poll_start_ns,
+                )
             return None
 
         head = int(self._cq_head[0])
@@ -278,6 +304,13 @@ class LiburingRing:
         user_data = int(cqe.user_data)
         result = int(cqe.res)
         self._cq_head[0] = head + 1
+        if profiler._active:
+            profiler.add_event(
+                "storage_kvcache.liburing.poll_any_complete",
+                "fs",
+                poll_start_ns,
+                time.perf_counter_ns() - poll_start_ns,
+            )
         return user_data, result
 
     def submit_rw(self, **kwargs: object) -> None:
@@ -306,8 +339,16 @@ class LiburingRing:
                 return result
 
     def poll(self, user_data: int) -> int | None:
+        poll_start_ns = time.perf_counter_ns()
         cached = self._completed.pop(user_data, None)
         if cached is not None:
+            if profiler._active:
+                profiler.add_event(
+                    "storage_kvcache.liburing.poll_cached",
+                    "fs",
+                    poll_start_ns,
+                    time.perf_counter_ns() - poll_start_ns,
+                )
             return cached
 
         while int(self._cq_head[0]) != int(self._cq_tail[0]):
@@ -318,9 +359,23 @@ class LiburingRing:
             result = int(cqe.res)
             self._cq_head[0] = head + 1
             if completed_user_data == user_data:
+                if profiler._active:
+                    profiler.add_event(
+                        "storage_kvcache.liburing.poll_complete",
+                        "fs",
+                        poll_start_ns,
+                        time.perf_counter_ns() - poll_start_ns,
+                    )
                 return result
             self._completed[completed_user_data] = result
 
+        if profiler._active:
+            profiler.add_event(
+                "storage_kvcache.liburing.poll_empty",
+                "fs",
+                poll_start_ns,
+                time.perf_counter_ns() - poll_start_ns,
+            )
         return None
 
     def close(self) -> None:
@@ -383,7 +438,12 @@ class LiburingFileStore:
         )
 
     def allocate_buffers(self, count: int) -> list[_AlignedIoBuffer]:
-        return [self._allocate_buffer() for _ in range(count)]
+        with profile_scope(
+            "storage_kvcache.liburing.allocate_buffers",
+            "fs",
+            args={"count": count, "io_size": self.io_size},
+        ):
+            return [self._allocate_buffer() for _ in range(count)]
 
     def free_buffers(self, buffers: list[_AlignedIoBuffer]) -> None:
         for buffer in buffers:
@@ -405,12 +465,18 @@ class LiburingFileStore:
         if not self.config.sync_on_store:
             return
         for path in set(paths):
-            self._fsync_dir(path)
+            with profile_scope("storage_kvcache.liburing.fsync_dir", "fs"):
+                self._fsync_dir(path)
 
     def _allocate_buffer(self) -> _AlignedIoBuffer:
         alignment = max(self.config.io_alignment, ctypes.sizeof(ctypes.c_void_p))
         ptr = ctypes.c_void_p()
-        alloc_err = _LIBC.posix_memalign(ctypes.byref(ptr), alignment, self.io_size)
+        with profile_scope(
+            "storage_kvcache.liburing.posix_memalign",
+            "fs",
+            args={"alignment": alignment, "io_size": self.io_size},
+        ):
+            alloc_err = _LIBC.posix_memalign(ctypes.byref(ptr), alignment, self.io_size)
         if alloc_err != 0 or not ptr.value:
             raise RuntimeError(f"posix_memalign() failed: {alloc_err}")
         array = np.ctypeslib.as_array(
@@ -432,7 +498,17 @@ class LiburingFileStore:
         if self.config.direct:
             flags |= getattr(os, "O_DIRECT", 0)
         mode = self.config.create_mode if self.config.create_mode is not None else 0o666
-        return os.open(path, flags, mode)
+        open_start_ns = time.perf_counter_ns()
+        fd = os.open(path, flags, mode)
+        if profiler._active:
+            profiler.add_event(
+                "storage_kvcache.liburing.open_fd",
+                "fs",
+                open_start_ns,
+                time.perf_counter_ns() - open_start_ns,
+                args={"write": write, "create": create, "truncate": truncate},
+            )
+        return fd
 
     def read_path_into(
         self,
@@ -441,10 +517,21 @@ class LiburingFileStore:
         consumer: Callable[[int, np.ndarray[Any, np.dtype[np.uint8]]], None],
     ) -> _TimedIoResult:
         start_ns = time.perf_counter_ns()
-        buffer = self._get_thread_buffer()
-        self._read_file(path, buffer)
+        with profile_scope("storage_kvcache.liburing.get_thread_buffer", "fs"):
+            buffer = self._get_thread_buffer()
+        with profile_scope(
+            "storage_kvcache.liburing.read_file_total",
+            "fs",
+            args={"io_size": self.io_size, "payload_size": self.payload_size},
+        ):
+            self._read_file(path, buffer)
         duration_ns = time.perf_counter_ns() - start_ns
-        consumer(slot_index, buffer.array[: self.payload_size])
+        with profile_scope(
+            "storage_kvcache.liburing.read_consumer_unpack",
+            "fs",
+            args={"payload_size": self.payload_size},
+        ):
+            consumer(slot_index, buffer.array[: self.payload_size])
         return _TimedIoResult(start_ns=start_ns, duration_ns=duration_ns)
 
     def store_slot_if_missing(
@@ -455,7 +542,17 @@ class LiburingFileStore:
     ) -> _TimedStoreResult:
         parent_path: str | None = None
         start_ns = time.perf_counter_ns()
-        if os.path.exists(path):
+        exists_start_ns = time.perf_counter_ns()
+        exists = os.path.exists(path)
+        if profiler._active:
+            profiler.add_event(
+                "storage_kvcache.liburing.store_exists",
+                "fs",
+                exists_start_ns,
+                time.perf_counter_ns() - exists_start_ns,
+                args={"exists": exists},
+            )
+        if exists:
             return _TimedStoreResult(
                 stored=False,
                 start_ns=start_ns,
@@ -463,23 +560,43 @@ class LiburingFileStore:
             )
 
         parent = os.path.dirname(path)
-        os.makedirs(parent, exist_ok=True)
+        with profile_scope("storage_kvcache.liburing.makedirs", "fs"):
+            os.makedirs(parent, exist_ok=True)
         temp_path = self._temp_path(path)
-        buffer = self._get_thread_buffer()
-        buffer.array.fill(0)
-        producer(slot_index, buffer.array[: self.payload_size])
+        with profile_scope("storage_kvcache.liburing.get_thread_buffer", "fs"):
+            buffer = self._get_thread_buffer()
+        with profile_scope(
+            "storage_kvcache.liburing.zero_buffer",
+            "fs",
+            args={"io_size": self.io_size},
+        ):
+            buffer.array.fill(0)
+        with profile_scope(
+            "storage_kvcache.liburing.store_producer_pack",
+            "fs",
+            args={"payload_size": self.payload_size},
+        ):
+            producer(slot_index, buffer.array[: self.payload_size])
 
         try:
             fd = self.open_fd(temp_path, write=True, create=True, truncate=True)
             try:
-                self._run_file_io(fd, buffer, path=temp_path, write=True)
+                with profile_scope(
+                    "storage_kvcache.liburing.file_write",
+                    "fs",
+                    args={"io_size": self.io_size},
+                ):
+                    self._run_file_io(fd, buffer, path=temp_path, write=True)
                 if self.config.sync_on_store:
-                    os.fsync(fd)
+                    with profile_scope("storage_kvcache.liburing.file_sync", "fs"):
+                        os.fsync(fd)
             finally:
-                os.close(fd)
+                with profile_scope("storage_kvcache.liburing.close_fd", "fs"):
+                    os.close(fd)
 
             try:
-                os.link(temp_path, path)
+                with profile_scope("storage_kvcache.liburing.link_temp", "fs"):
+                    os.link(temp_path, path)
                 if self.config.sync_on_store:
                     parent_path = parent
                 return _TimedStoreResult(
@@ -496,25 +613,42 @@ class LiburingFileStore:
                 )
         finally:
             try:
-                os.unlink(temp_path)
+                with profile_scope("storage_kvcache.liburing.unlink_temp", "fs"):
+                    os.unlink(temp_path)
             except FileNotFoundError:
                 pass
 
     def _read_file(self, path: str, buffer: _AlignedIoBuffer) -> None:
         fd = self.open_fd(path, write=False, create=False, truncate=False)
         try:
-            self._run_file_io(fd, buffer, path=path, write=False)
+            with profile_scope(
+                "storage_kvcache.liburing.file_read",
+                "fs",
+                args={"io_size": self.io_size},
+            ):
+                self._run_file_io(fd, buffer, path=path, write=False)
         finally:
-            os.close(fd)
+            with profile_scope("storage_kvcache.liburing.close_fd", "fs"):
+                os.close(fd)
 
     def _run_file_io(
         self, fd: int, buffer: _AlignedIoBuffer, *, path: str, write: bool
     ) -> None:
         payload = memoryview(buffer.array)
         if write:
+            io_start_ns = time.perf_counter_ns()
             result_nbytes = os.pwritev(fd, [payload], 0)
         else:
+            io_start_ns = time.perf_counter_ns()
             result_nbytes = os.preadv(fd, [payload], 0)
+        if profiler._active:
+            profiler.add_event(
+                "storage_kvcache.liburing.pwritev" if write else "storage_kvcache.liburing.preadv",
+                "fs",
+                io_start_ns,
+                time.perf_counter_ns() - io_start_ns,
+                args={"io_size": self.io_size},
+            )
         if result_nbytes < 0:
             raise OSError(
                 -result_nbytes, f"preadv/pwritev {'write' if write else 'read'} failed for {path}"
