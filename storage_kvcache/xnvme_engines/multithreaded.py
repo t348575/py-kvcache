@@ -572,7 +572,14 @@ class MultithreadedXNvmeOffloadingHandler(OffloadingHandler):
             slot_indexes=list(range(total_file_count)),
             on_read_complete=lambda _slot_index, _file_index: None,
             file_io_samples=file_io_samples,
-            max_queued_reads=total_file_count,
+            max_queued_reads=max(
+                1,
+                min(
+                    total_file_count,
+                    getattr(self.file_store, "uring_depth", total_file_count),
+                ),
+            ),
+            reuse_slots=False,
         )
 
     def _read_storage_blocks_batched(
@@ -586,12 +593,14 @@ class MultithreadedXNvmeOffloadingHandler(OffloadingHandler):
         max_queued_reads: int,
         drain_ready: Any | None = None,
         wait_when_idle: Any | None = None,
+        reuse_slots: bool = True,
     ) -> None:
         total_file_count = len(block_hashes)
         if total_file_count == 0:
             return
-        if len(slot_indexes) < max_queued_reads:
-            raise ValueError("slot_indexes must cover max_queued_reads")
+        required_slots = max_queued_reads if reuse_slots else total_file_count
+        if len(slot_indexes) < required_slots:
+            raise ValueError("slot_indexes does not cover requested reads")
 
         queued_reads: dict[int, Any] = {}
         slot_to_file_index: dict[int, int] = {}
@@ -642,12 +651,55 @@ class MultithreadedXNvmeOffloadingHandler(OffloadingHandler):
                     )
                 )
 
+        def submit_preserved_reads() -> None:
+            nonlocal next_file_index
+            available = max_queued_reads - len(queued_reads)
+            if available <= 0:
+                return
+
+            paths: list[str] = []
+            read_slot_indexes: list[int] = []
+            direct_targets: list[np.ndarray[Any, np.dtype[np.uint8]] | None] = []
+            while available > 0 and next_file_index < total_file_count:
+                file_index = next_file_index
+                slot_index = slot_indexes[file_index]
+                block_hash = block_hashes[file_index]
+                slot_to_file_index[slot_index] = file_index
+                paths.append(self.file_mapper.get_file_name(block_hash))
+                read_slot_indexes.append(slot_index)
+                direct_target = None
+                if self.file_store.io_size == self.layout.storage_block_bytes:
+                    direct_target = self.layout.direct_storage_slot_view(
+                        staging_tensors,
+                        slot_index,
+                        alignment=self.file_store.config.io_alignment,
+                    )
+                direct_targets.append(direct_target)
+                next_file_index += 1
+                available -= 1
+
+            if paths:
+                queued_reads.update(
+                    self.file_store.queue_read_paths(
+                        paths,
+                        read_slot_indexes,
+                        unpack_storage_slot,
+                        direct_targets=direct_targets,
+                    )
+                )
+
         try:
-            submit_ready_reads()
+            if reuse_slots:
+                submit_ready_reads()
+            else:
+                submit_preserved_reads()
             while queued_reads or next_file_index < total_file_count:
                 if drain_ready is not None:
                     drain_ready(free_slots)
-                submit_ready_reads()
+                if reuse_slots:
+                    submit_ready_reads()
+                else:
+                    submit_preserved_reads()
 
                 completed_read = None
                 if queued_reads:
@@ -670,7 +722,7 @@ class MultithreadedXNvmeOffloadingHandler(OffloadingHandler):
                 )
                 file_index = slot_to_file_index.pop(slot_index)
                 on_read_complete(slot_index, file_index)
-                if drain_ready is None:
+                if reuse_slots and drain_ready is None:
                     free_slots.append(slot_index)
         finally:
             self.file_store.close_queued_reads(queued_reads)
