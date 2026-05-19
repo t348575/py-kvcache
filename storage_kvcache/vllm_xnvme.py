@@ -83,8 +83,11 @@ def _build_block_mapping(
 
 
 class SharedStorageLoadStoreSpec(LoadStoreSpec):
-    def __init__(self, block_hashes: Iterable[bytes]):
+    def __init__(
+        self, block_hashes: Iterable[bytes], *, prefetch_id: str | None = None
+    ):
         self.block_hashes = list(block_hashes)
+        self.prefetch_id = prefetch_id
 
     @staticmethod
     def medium() -> str:

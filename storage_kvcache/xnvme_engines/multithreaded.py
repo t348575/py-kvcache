@@ -48,6 +48,16 @@ class _PendingCudaCopy:
     sample_num_bytes: int
 
 
+@dataclass
+class _PrefetchState:
+    prefetch_id: str
+    block_hashes: list[bytes]
+    staging_tensors: list[torch.Tensor]
+    future: Future[None] | None = None
+    complete: bool = False
+    failed: bool = False
+
+
 class MultithreadedXNvmeOffloadingHandler(OffloadingHandler):
     def __init__(
         self,
@@ -75,6 +85,7 @@ class MultithreadedXNvmeOffloadingHandler(OffloadingHandler):
         self._lock = threading.Lock()
         self._transfer_jobs: dict[int, tuple[int, str, str, str]] = {}
         self._profiled_jobs: set[int] = set()
+        self._prefetches: dict[str, _PrefetchState] = {}
         self._staging_tensors = self.layout.allocate_staging_tensors(
             staging_slot_capacity
         )
@@ -85,12 +96,16 @@ class MultithreadedXNvmeOffloadingHandler(OffloadingHandler):
             np.empty((self.layout.storage_block_size_factor, 2), dtype=np.int64)
             for _ in range(staging_slot_capacity)
         ]
-        self._mapping_tensors = [torch.from_numpy(buffer) for buffer in self._mapping_buffers]
+        self._mapping_tensors = [
+            torch.from_numpy(buffer) for buffer in self._mapping_buffers
+        ]
         self._slot_block_ids = [
             np.asarray([slot_index], dtype=np.int64)
             for slot_index in range(staging_slot_capacity)
         ]
-        max_copy_entries = len(self.layout.gpu_tensors) * self.layout.storage_block_size_factor
+        max_copy_entries = (
+            len(self.layout.gpu_tensors) * self.layout.storage_block_size_factor
+        )
         self._batch_src_ptrs = [
             np.empty(max_copy_entries, dtype=np.int64)
             for _ in range(staging_slot_capacity)
@@ -103,9 +118,15 @@ class MultithreadedXNvmeOffloadingHandler(OffloadingHandler):
             np.empty(max_copy_entries, dtype=np.int64)
             for _ in range(staging_slot_capacity)
         ]
-        self._batch_src_tensors = [torch.from_numpy(buffer) for buffer in self._batch_src_ptrs]
-        self._batch_dst_tensors = [torch.from_numpy(buffer) for buffer in self._batch_dst_ptrs]
-        self._batch_size_tensors = [torch.from_numpy(buffer) for buffer in self._batch_sizes]
+        self._batch_src_tensors = [
+            torch.from_numpy(buffer) for buffer in self._batch_src_ptrs
+        ]
+        self._batch_dst_tensors = [
+            torch.from_numpy(buffer) for buffer in self._batch_dst_ptrs
+        ]
+        self._batch_size_tensors = [
+            torch.from_numpy(buffer) for buffer in self._batch_sizes
+        ]
 
     def transfer_async(
         self,
@@ -143,6 +164,89 @@ class MultithreadedXNvmeOffloadingHandler(OffloadingHandler):
             )
             self._futures[job_id] = self._executor.submit(
                 self._run_transfer, job_id, spec
+            )
+        return True
+
+    def prefetch_async(
+        self,
+        prefetch_id: str,
+        src_spec: SharedStorageLoadStoreSpec,
+        profile_tid: str = "kv_prefetch",
+        req_id: str = "",
+    ) -> bool:
+        if not isinstance(src_spec, SharedStorageLoadStoreSpec):
+            return False
+        if not all(
+            hasattr(self.file_store, name)
+            for name in ("queue_read_paths", "poll_queued_read", "close_queued_reads")
+        ):
+            return False
+        if not src_spec.block_hashes:
+            return True
+
+        with self._lock:
+            existing = self._prefetches.get(prefetch_id)
+            if existing is not None and existing.block_hashes == src_spec.block_hashes:
+                return True
+            for old_id, old_state in list(self._prefetches.items()):
+                if old_state.future is not None and not old_state.future.done():
+                    logger.debug(
+                        "Skipping prefetch %s because prefetch %s is still active",
+                        prefetch_id,
+                        old_id,
+                    )
+                    return False
+                self._prefetches.pop(old_id, None)
+
+            state = _PrefetchState(
+                prefetch_id=prefetch_id,
+                block_hashes=list(src_spec.block_hashes),
+                staging_tensors=self.layout.allocate_staging_tensors(
+                    len(src_spec.block_hashes)
+                ),
+            )
+            future = self._executor.submit(
+                self._run_prefetch, state, profile_tid, req_id
+            )
+            state.future = future
+            self._prefetches[prefetch_id] = state
+        return True
+
+    def load_from_prefetch_async(
+        self,
+        job_id: int,
+        prefetch_id: str,
+        src_spec: SharedStorageLoadStoreSpec,
+        dst_spec: GPULoadStoreSpec,
+        profile_tid: str = "kv_load",
+        req_id: str = "",
+    ) -> bool:
+        with self._lock:
+            state = self._prefetches.get(prefetch_id)
+            if state is None:
+                return False
+            if state.block_hashes != src_spec.block_hashes:
+                self._prefetches.pop(prefetch_id, None)
+                return False
+            if state.future is not None and state.future.done():
+                try:
+                    state.future.result()
+                except Exception:
+                    logger.warning("KV prefetch %s failed", prefetch_id, exc_info=True)
+                    self._prefetches.pop(prefetch_id, None)
+                    return False
+            if not state.complete or state.failed:
+                return False
+            if job_id in self._futures:
+                raise ValueError(f"job {job_id} is already active")
+            self._transfer_jobs[job_id] = (
+                time.perf_counter_ns(),
+                profile_tid,
+                req_id,
+                "storage_to_gpu",
+            )
+            self._futures[job_id] = self._executor.submit(
+                self._run_place_prefetch, job_id, prefetch_id, state, dst_spec
             )
         return True
 
@@ -190,6 +294,72 @@ class MultithreadedXNvmeOffloadingHandler(OffloadingHandler):
             cuda_copy_samples=cuda_copy_samples,
         )
 
+    def _run_prefetch(
+        self,
+        state: _PrefetchState,
+        profile_tid: str,
+        req_id: str,
+    ) -> None:
+        started_ns = time.perf_counter_ns()
+        file_io_samples: list[Sample] = []
+        try:
+            self._prefetch_read(state, file_io_samples)
+            state.complete = True
+        except Exception:
+            state.failed = True
+            logger.warning("KV prefetch %s failed", state.prefetch_id, exc_info=True)
+            raise
+        finally:
+            end_ns = time.perf_counter_ns()
+            if getattr(profiler, "_active", False):
+                profiler.add_event(
+                    name="xnvme_prefetch_read",
+                    category="xnvme_transfer",
+                    start_ns=started_ns,
+                    duration_ns=end_ns - started_ns,
+                    tid=profile_tid,
+                    args={
+                        "req_id": req_id,
+                        "prefetch_id": state.prefetch_id,
+                        "num_bytes": len(state.block_hashes)
+                        * self.layout.storage_block_bytes,
+                        "success": state.complete and not state.failed,
+                    },
+                )
+
+    def _run_place_prefetch(
+        self,
+        job_id: int,
+        prefetch_id: str,
+        state: _PrefetchState,
+        dst_spec: GPULoadStoreSpec,
+    ) -> _InstrumentedTransferResult:
+        started = time.perf_counter()
+        file_io_samples: list[Sample] = []
+        cuda_copy_samples: list[Sample] = []
+        try:
+            transfer_size = self._place_prefetched(
+                state, dst_spec, cuda_copy_samples
+            )
+        finally:
+            with self._lock:
+                if self._prefetches.get(prefetch_id) is state:
+                    self._prefetches.pop(prefetch_id, None)
+        return _InstrumentedTransferResult(
+            result=TransferResult(
+                job_id=job_id,
+                success=True,
+                transfer_size=transfer_size,
+                transfer_time=time.perf_counter() - started,
+                transfer_type=(
+                    SharedStorageLoadStoreSpec.medium(),
+                    GPULoadStoreSpec.medium(),
+                ),
+            ),
+            file_io_samples=file_io_samples,
+            cuda_copy_samples=cuda_copy_samples,
+        )
+
     def _launch_swap_blocks(
         self,
         slot_index: int,
@@ -217,8 +387,12 @@ class MultithreadedXNvmeOffloadingHandler(OffloadingHandler):
                     self.layout.bytes_per_kernel_block,
                 ):
                     end = offset + mapping_len
-                    src_ptrs[offset:end] = src_tensor.data_ptr() + mapping[:, 0] * block_bytes
-                    dst_ptrs[offset:end] = dst_tensor.data_ptr() + mapping[:, 1] * block_bytes
+                    src_ptrs[offset:end] = (
+                        src_tensor.data_ptr() + mapping[:, 0] * block_bytes
+                    )
+                    dst_ptrs[offset:end] = (
+                        dst_tensor.data_ptr() + mapping[:, 1] * block_bytes
+                    )
                     sizes[offset:end] = block_bytes
                     offset = end
                 ops.swap_blocks_batch(
@@ -280,6 +454,186 @@ class MultithreadedXNvmeOffloadingHandler(OffloadingHandler):
         self, slot_index: int, payload: np.ndarray
     ) -> None:
         self.layout.unpack_storage_slot(payload, self._staging_tensors, slot_index)
+
+    def _prefetch_read(
+        self, state: _PrefetchState, file_io_samples: list[Sample]
+    ) -> None:
+        total_file_count = len(state.block_hashes)
+        logger.debug(
+            "Prefetching %d blocks with id %s", total_file_count, state.prefetch_id
+        )
+        self._read_storage_blocks_batched(
+            state.block_hashes,
+            state.staging_tensors,
+            slot_indexes=list(range(total_file_count)),
+            on_read_complete=lambda _slot_index, _file_index: None,
+            file_io_samples=file_io_samples,
+            max_queued_reads=total_file_count,
+        )
+
+    def _read_storage_blocks_batched(
+        self,
+        block_hashes: list[bytes],
+        staging_tensors: list[torch.Tensor],
+        *,
+        slot_indexes: list[int],
+        on_read_complete: Any,
+        file_io_samples: list[Sample],
+        max_queued_reads: int,
+        drain_ready: Any | None = None,
+        wait_when_idle: Any | None = None,
+    ) -> None:
+        total_file_count = len(block_hashes)
+        if total_file_count == 0:
+            return
+        if len(slot_indexes) < max_queued_reads:
+            raise ValueError("slot_indexes must cover max_queued_reads")
+
+        queued_reads: dict[int, Any] = {}
+        slot_to_file_index: dict[int, int] = {}
+        free_slots = list(slot_indexes[:max_queued_reads])
+        next_file_index = 0
+
+        def unpack_storage_slot(slot_index: int, payload: np.ndarray) -> None:
+            self.layout.unpack_storage_slot(payload, staging_tensors, slot_index)
+
+        def submit_ready_reads() -> None:
+            nonlocal next_file_index
+            if drain_ready is not None:
+                drain_ready(free_slots)
+            if not free_slots or next_file_index >= total_file_count:
+                return
+            available = max_queued_reads - len(queued_reads)
+            if available <= 0:
+                return
+
+            paths: list[str] = []
+            read_slot_indexes: list[int] = []
+            direct_targets: list[np.ndarray[Any, np.dtype[np.uint8]] | None] = []
+            while free_slots and available > 0 and next_file_index < total_file_count:
+                slot_index = free_slots.pop()
+                file_index = next_file_index
+                block_hash = block_hashes[file_index]
+                slot_to_file_index[slot_index] = file_index
+                paths.append(self.file_mapper.get_file_name(block_hash))
+                read_slot_indexes.append(slot_index)
+                direct_target = None
+                if self.file_store.io_size == self.layout.storage_block_bytes:
+                    direct_target = self.layout.direct_storage_slot_view(
+                        staging_tensors,
+                        slot_index,
+                        alignment=self.file_store.config.io_alignment,
+                    )
+                direct_targets.append(direct_target)
+                next_file_index += 1
+                available -= 1
+
+            if paths:
+                queued_reads.update(
+                    self.file_store.queue_read_paths(
+                        paths,
+                        read_slot_indexes,
+                        unpack_storage_slot,
+                        direct_targets=direct_targets,
+                    )
+                )
+
+        try:
+            submit_ready_reads()
+            while queued_reads or next_file_index < total_file_count:
+                if drain_ready is not None:
+                    drain_ready(free_slots)
+                submit_ready_reads()
+
+                completed_read = None
+                if queued_reads:
+                    completed_read = self.file_store.poll_queued_read(queued_reads)
+
+                if completed_read is None:
+                    if not queued_reads and wait_when_idle is not None:
+                        wait_when_idle(free_slots)
+                    else:
+                        time.sleep(0)
+                    continue
+
+                slot_index, result = completed_read
+                file_io_samples.append(
+                    (
+                        result.start_ns,
+                        result.duration_ns,
+                        self.layout.storage_block_bytes,
+                    )
+                )
+                file_index = slot_to_file_index.pop(slot_index)
+                on_read_complete(slot_index, file_index)
+                if drain_ready is None:
+                    free_slots.append(slot_index)
+        finally:
+            self.file_store.close_queued_reads(queued_reads)
+
+    def _place_prefetched(
+        self,
+        state: _PrefetchState,
+        dst_spec: GPULoadStoreSpec,
+        cuda_copy_samples: list[Sample],
+    ) -> int:
+        total_file_count = len(state.block_hashes)
+        if total_file_count == 0:
+            return 0
+
+        dst_blocks_per_file = self._split_block_ids_for_files(
+            dst_spec.block_ids,
+            total_file_count,
+            self._get_first_group_block_index(dst_spec),
+        )
+        free_slots = list(range(min(self.staging_slot_capacity, total_file_count)))
+        pending_copies: dict[int, _PendingCudaCopy] = {}
+        next_file_index = 0
+
+        def launch_next_copy(slot_index: int) -> None:
+            nonlocal next_file_index
+            if next_file_index >= total_file_count:
+                return
+            file_index = next_file_index
+            src_blocks = np.asarray([file_index], dtype=np.int64)
+            src_to_dst = self._build_block_mapping(
+                slot_index,
+                src_blocks,
+                self.layout.storage_block_size_factor,
+                dst_blocks_per_file[file_index],
+                self.layout.gpu_block_size_factor,
+            )
+            pending_copies[slot_index] = self._launch_swap_blocks(
+                slot_index,
+                state.staging_tensors,
+                self.layout.gpu_tensors,
+                src_to_dst,
+                self.layout.storage_block_bytes,
+            )
+            next_file_index += 1
+
+        def drain_ready_copies(*, force: bool = False) -> None:
+            for slot_index, pending in list(pending_copies.items()):
+                if force or self._cuda_copy_done(pending):
+                    self._complete_cuda_copy(pending, cuda_copy_samples)
+                    pending_copies.pop(slot_index)
+                    free_slots.append(slot_index)
+
+        for slot_index in list(free_slots):
+            free_slots.remove(slot_index)
+            launch_next_copy(slot_index)
+
+        while pending_copies or next_file_index < total_file_count:
+            drain_ready_copies()
+            while free_slots and next_file_index < total_file_count:
+                launch_next_copy(free_slots.pop())
+            if pending_copies:
+                time.sleep(0)
+            if not pending_copies and next_file_index >= total_file_count:
+                break
+        drain_ready_copies(force=True)
+
+        return total_file_count * self.layout.storage_block_bytes
 
     def _load_slot(
         self,
@@ -550,99 +904,46 @@ class MultithreadedXNvmeOffloadingHandler(OffloadingHandler):
                 getattr(self.file_store, "uring_depth", self.staging_slot_capacity),
             ),
         )
-        free_slots = list(range(max_queued_reads))
-        queued_reads: dict[int, Any] = {}
         pending_copies: dict[int, _PendingCudaCopy] = {}
-        slot_to_dst_blocks: dict[int, np.ndarray] = {}
-        next_file_index = 0
 
-        def submit_ready_reads() -> None:
-            nonlocal next_file_index
-            if not free_slots or next_file_index >= total_file_count:
-                return
-            available = max_queued_reads - len(queued_reads)
-            if available <= 0:
-                return
-
-            paths: list[str] = []
-            slot_indexes: list[int] = []
-            direct_targets: list[np.ndarray[Any, np.dtype[np.uint8]] | None] = []
-            while free_slots and available > 0 and next_file_index < total_file_count:
-                slot_index = free_slots.pop()
-                block_hash = src_spec.block_hashes[next_file_index]
-                slot_to_dst_blocks[slot_index] = dst_blocks_per_file[next_file_index]
-                paths.append(self.file_mapper.get_file_name(block_hash))
-                slot_indexes.append(slot_index)
-                direct_target = None
-                if self.file_store.io_size == self.layout.storage_block_bytes:
-                    direct_target = self.layout.direct_storage_slot_view(
-                        self._staging_tensors,
-                        slot_index,
-                        alignment=self.file_store.config.io_alignment,
-                    )
-                direct_targets.append(direct_target)
-                next_file_index += 1
-                available -= 1
-
-            if paths:
-                queued_reads.update(
-                    self.file_store.queue_read_paths(
-                        paths,
-                        slot_indexes,
-                        self._unpack_storage_slot_from_payload,
-                        direct_targets=direct_targets,
-                    )
-                )
-
-        def drain_ready_copies(*, force: bool = False) -> None:
+        def drain_ready_copies(
+            free_slots: list[int], *, force: bool = False
+        ) -> None:
             for slot_index, pending in list(pending_copies.items()):
                 if force or self._cuda_copy_done(pending):
                     self._complete_cuda_copy(pending, cuda_copy_samples)
                     pending_copies.pop(slot_index)
                     free_slots.append(slot_index)
 
-        try:
-            submit_ready_reads()
-            while queued_reads or pending_copies or next_file_index < total_file_count:
-                drain_ready_copies()
-                submit_ready_reads()
+        def on_read_complete(slot_index: int, file_index: int) -> None:
+            dst_blocks = dst_blocks_per_file[file_index]
+            src_to_dst = self._build_block_mapping(
+                slot_index,
+                self._slot_block_ids[slot_index],
+                self.layout.storage_block_size_factor,
+                dst_blocks,
+                self.layout.gpu_block_size_factor,
+            )
+            pending_copies[slot_index] = self._launch_swap_blocks(
+                slot_index,
+                self._staging_tensors,
+                self.layout.gpu_tensors,
+                src_to_dst,
+                self.layout.storage_block_bytes,
+            )
 
-                completed_read = None
-                if queued_reads:
-                    completed_read = self.file_store.poll_queued_read(queued_reads)
-
-                if completed_read is None:
-                    if not queued_reads and pending_copies:
-                        drain_ready_copies(force=True)
-                    else:
-                        time.sleep(0)
-                    continue
-
-                slot_index, result = completed_read
-                file_io_samples.append(
-                    (
-                        result.start_ns,
-                        result.duration_ns,
-                        self.layout.storage_block_bytes,
-                    )
-                )
-                dst_blocks = slot_to_dst_blocks.pop(slot_index)
-                src_to_dst = self._build_block_mapping(
-                    slot_index,
-                    self._slot_block_ids[slot_index],
-                    self.layout.storage_block_size_factor,
-                    dst_blocks,
-                    self.layout.gpu_block_size_factor,
-                )
-                pending_copies[slot_index] = self._launch_swap_blocks(
-                    slot_index,
-                    self._staging_tensors,
-                    self.layout.gpu_tensors,
-                    src_to_dst,
-                    self.layout.storage_block_bytes,
-                )
-        finally:
-            self.file_store.close_queued_reads(queued_reads)
+        self._read_storage_blocks_batched(
+            src_spec.block_hashes,
+            self._staging_tensors,
+            slot_indexes=list(range(max_queued_reads)),
+            on_read_complete=on_read_complete,
+            file_io_samples=file_io_samples,
+            max_queued_reads=max_queued_reads,
+            drain_ready=drain_ready_copies,
+            wait_when_idle=partial(drain_ready_copies, force=True),
+        )
+        while pending_copies:
+            drain_ready_copies([], force=True)
 
         return total_file_count * self.layout.storage_block_bytes
 
