@@ -184,9 +184,18 @@ class MultithreadedXNvmeOffloadingHandler(OffloadingHandler):
         if not src_spec.block_hashes:
             return True
 
+        submit_start_ns = time.perf_counter_ns()
         with self._lock:
             existing = self._prefetches.get(prefetch_id)
             if existing is not None and existing.block_hashes == src_spec.block_hashes:
+                profiler.add_event(
+                    name="xnvme_prefetch_submit_duplicate",
+                    category="xnvme_transfer",
+                    start_ns=submit_start_ns,
+                    duration_ns=time.perf_counter_ns() - submit_start_ns,
+                    tid=profile_tid,
+                    args={"req_id": req_id, "prefetch_id": prefetch_id},
+                )
                 return True
             for old_id, old_state in list(self._prefetches.items()):
                 if old_state.future is not None and not old_state.future.done():
@@ -194,6 +203,18 @@ class MultithreadedXNvmeOffloadingHandler(OffloadingHandler):
                         "Skipping prefetch %s because prefetch %s is still active",
                         prefetch_id,
                         old_id,
+                    )
+                    profiler.add_event(
+                        name="xnvme_prefetch_submit_rejected",
+                        category="xnvme_transfer",
+                        start_ns=submit_start_ns,
+                        duration_ns=time.perf_counter_ns() - submit_start_ns,
+                        tid=profile_tid,
+                        args={
+                            "req_id": req_id,
+                            "prefetch_id": prefetch_id,
+                            "active_prefetch_id": old_id,
+                        },
                     )
                     return False
                 self._prefetches.pop(old_id, None)
@@ -210,6 +231,19 @@ class MultithreadedXNvmeOffloadingHandler(OffloadingHandler):
             )
             state.future = future
             self._prefetches[prefetch_id] = state
+            profiler.add_event(
+                name="xnvme_prefetch_submit",
+                category="xnvme_transfer",
+                start_ns=submit_start_ns,
+                duration_ns=time.perf_counter_ns() - submit_start_ns,
+                tid=profile_tid,
+                args={
+                    "req_id": req_id,
+                    "prefetch_id": prefetch_id,
+                    "num_bytes": len(src_spec.block_hashes)
+                    * self.layout.storage_block_bytes,
+                },
+            )
         return True
 
     def load_from_prefetch_async(
@@ -221,12 +255,29 @@ class MultithreadedXNvmeOffloadingHandler(OffloadingHandler):
         profile_tid: str = "kv_load",
         req_id: str = "",
     ) -> bool:
+        submit_start_ns = time.perf_counter_ns()
         with self._lock:
             state = self._prefetches.get(prefetch_id)
             if state is None:
+                profiler.add_event(
+                    name="xnvme_prefetch_place_miss",
+                    category="xnvme_transfer",
+                    start_ns=submit_start_ns,
+                    duration_ns=time.perf_counter_ns() - submit_start_ns,
+                    tid=profile_tid,
+                    args={"req_id": req_id, "prefetch_id": prefetch_id},
+                )
                 return False
             if state.block_hashes != src_spec.block_hashes:
                 self._prefetches.pop(prefetch_id, None)
+                profiler.add_event(
+                    name="xnvme_prefetch_place_mismatch",
+                    category="xnvme_transfer",
+                    start_ns=submit_start_ns,
+                    duration_ns=time.perf_counter_ns() - submit_start_ns,
+                    tid=profile_tid,
+                    args={"req_id": req_id, "prefetch_id": prefetch_id},
+                )
                 return False
             if state.future is not None and state.future.done():
                 try:
@@ -234,8 +285,24 @@ class MultithreadedXNvmeOffloadingHandler(OffloadingHandler):
                 except Exception:
                     logger.warning("KV prefetch %s failed", prefetch_id, exc_info=True)
                     self._prefetches.pop(prefetch_id, None)
+                    profiler.add_event(
+                        name="xnvme_prefetch_place_failed_prefetch",
+                        category="xnvme_transfer",
+                        start_ns=submit_start_ns,
+                        duration_ns=time.perf_counter_ns() - submit_start_ns,
+                        tid=profile_tid,
+                        args={"req_id": req_id, "prefetch_id": prefetch_id},
+                    )
                     return False
             if not state.complete or state.failed:
+                profiler.add_event(
+                    name="xnvme_prefetch_place_not_ready",
+                    category="xnvme_transfer",
+                    start_ns=submit_start_ns,
+                    duration_ns=time.perf_counter_ns() - submit_start_ns,
+                    tid=profile_tid,
+                    args={"req_id": req_id, "prefetch_id": prefetch_id},
+                )
                 return False
             if job_id in self._futures:
                 raise ValueError(f"job {job_id} is already active")
@@ -247,6 +314,20 @@ class MultithreadedXNvmeOffloadingHandler(OffloadingHandler):
             )
             self._futures[job_id] = self._executor.submit(
                 self._run_place_prefetch, job_id, prefetch_id, state, dst_spec
+            )
+            profiler.add_event(
+                name="xnvme_prefetch_place_submit",
+                category="xnvme_transfer",
+                start_ns=submit_start_ns,
+                duration_ns=time.perf_counter_ns() - submit_start_ns,
+                tid=profile_tid,
+                args={
+                    "req_id": req_id,
+                    "prefetch_id": prefetch_id,
+                    "job_id": job_id,
+                    "num_bytes": len(src_spec.block_hashes)
+                    * self.layout.storage_block_bytes,
+                },
             )
         return True
 
@@ -335,6 +416,7 @@ class MultithreadedXNvmeOffloadingHandler(OffloadingHandler):
         dst_spec: GPULoadStoreSpec,
     ) -> _InstrumentedTransferResult:
         started = time.perf_counter()
+        started_ns = time.perf_counter_ns()
         file_io_samples: list[Sample] = []
         cuda_copy_samples: list[Sample] = []
         try:
@@ -345,6 +427,17 @@ class MultithreadedXNvmeOffloadingHandler(OffloadingHandler):
             with self._lock:
                 if self._prefetches.get(prefetch_id) is state:
                     self._prefetches.pop(prefetch_id, None)
+        profiler.add_event(
+            name=f"xnvme_prefetch_place(job={job_id})",
+            category="xnvme_transfer",
+            start_ns=started_ns,
+            duration_ns=time.perf_counter_ns() - started_ns,
+            tid="kv_load",
+            args={
+                "prefetch_id": prefetch_id,
+                "num_bytes": transfer_size,
+            },
+        )
         return _InstrumentedTransferResult(
             result=TransferResult(
                 job_id=job_id,
