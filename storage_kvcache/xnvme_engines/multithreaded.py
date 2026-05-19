@@ -294,7 +294,7 @@ class MultithreadedXNvmeOffloadingHandler(OffloadingHandler):
                         args={"req_id": req_id, "prefetch_id": prefetch_id},
                     )
                     return False
-            if not state.complete or state.failed:
+            if state.failed:
                 profiler.add_event(
                     name="xnvme_prefetch_place_not_ready",
                     category="xnvme_transfer",
@@ -420,6 +420,17 @@ class MultithreadedXNvmeOffloadingHandler(OffloadingHandler):
         file_io_samples: list[Sample] = []
         cuda_copy_samples: list[Sample] = []
         try:
+            if state.future is not None and not state.complete:
+                wait_start_ns = time.perf_counter_ns()
+                state.future.result()
+                profiler.add_event(
+                    name=f"xnvme_prefetch_wait(job={job_id})",
+                    category="xnvme_transfer",
+                    start_ns=wait_start_ns,
+                    duration_ns=time.perf_counter_ns() - wait_start_ns,
+                    tid="kv_load",
+                    args={"prefetch_id": prefetch_id},
+                )
             transfer_size = self._place_prefetched(
                 state, dst_spec, cuda_copy_samples
             )
