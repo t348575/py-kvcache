@@ -58,10 +58,18 @@ class KvikioDirectOffloadingHandler(OffloadingHandler):
         self._file_executor = ThreadPoolExecutor(
             max_workers=self._parallelism, thread_name_prefix="kv-kvikio-file"
         )
+        self._warm_executor(self._executor, self._parallelism)
+        self._warm_executor(self._file_executor, self._parallelism)
         self._futures: dict[int, Future[_InstrumentedTransferResult]] = {}
         self._lock = threading.Lock()
         self._transfer_jobs: dict[int, tuple[int, str, str, str]] = {}
         self._profiled_jobs: set[int] = set()
+
+    @staticmethod
+    def _warm_executor(executor: ThreadPoolExecutor, count: int) -> None:
+        futures = [executor.submit(lambda: None) for _ in range(count)]
+        for future in futures:
+            future.result()
 
     def transfer_async(
         self,

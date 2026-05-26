@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import os
 import time
-from collections.abc import Iterable, Iterator
+from collections.abc import Callable, Iterable, Iterator
 from dataclasses import dataclass
+from typing import Any
 
 import numpy as np
 import torch
@@ -84,20 +85,27 @@ def _build_block_mapping(
 
 
 class SharedStorageLoadStoreSpec(LoadStoreSpec):
-    def __init__(
-        self, block_hashes: Iterable[bytes], *, prefetch_id: str | None = None
-    ):
+    def __init__(self, block_hashes: Iterable[bytes]):
         self.block_hashes = list(block_hashes)
-        self.prefetch_id = prefetch_id
 
     @staticmethod
     def medium() -> str:
         return "SHARED_STORAGE"
 
 
+@dataclass(frozen=True)
+class SharedStoragePreloadMessage:
+    block_hashes: tuple[bytes, ...]
+
+
 class SharedStorageOffloadingManager(OffloadingManager):
-    def __init__(self, file_mapper: FileMapper):
+    def __init__(self, file_mapper: FileMapper, *, preload_batch_size: int = 1):
         self.file_mapper = file_mapper
+        self.preload_batch_size = max(1, preload_batch_size)
+        self._worker_message_sender: Callable[[Any], None] | None = None
+
+    def set_worker_message_sender(self, sender: Callable[[Any], None] | None) -> None:
+        self._worker_message_sender = sender
 
     @staticmethod
     def _get_block_hash(key: OffloadKey) -> bytes:
@@ -112,6 +120,29 @@ class SharedStorageOffloadingManager(OffloadingManager):
         start_ns = time.perf_counter_ns()
         hit_count = 0
         checked = 0
+        preload_batch: list[bytes] = []
+
+        def flush_preload_batch() -> None:
+            if not preload_batch:
+                return
+            send_start_ns = time.perf_counter_ns()
+            sent = False
+            num_blocks = len(preload_batch)
+            if self._worker_message_sender is not None:
+                self._worker_message_sender(
+                    SharedStoragePreloadMessage(tuple(preload_batch))
+                )
+                sent = True
+            preload_batch.clear()
+            if profiler._active:
+                profiler.add_event(
+                    "storage_kvcache.manager.lookup_preload_message",
+                    "kv_offload",
+                    send_start_ns,
+                    time.perf_counter_ns() - send_start_ns,
+                    args={"sent": sent, "num_blocks": num_blocks},
+                )
+
         for key in keys:
             checked += 1
             block_hash = self._get_block_hash(key)
@@ -130,6 +161,10 @@ class SharedStorageOffloadingManager(OffloadingManager):
             if not exists:
                 break
             hit_count += 1
+            preload_batch.append(block_hash)
+            if len(preload_batch) >= self.preload_batch_size:
+                flush_preload_batch()
+        flush_preload_batch()
         if profiler._active:
             profiler.add_event(
                 "storage_kvcache.manager.lookup",
@@ -392,7 +427,15 @@ class XNvmeOffloadingSpec(OffloadingSpec):
 
     def get_manager(self) -> OffloadingManager:
         if self._manager is None:
-            self._manager = SharedStorageOffloadingManager(self.file_mapper)
+            preload_batch_size = int(
+                self.extra_config.get(
+                    "preload_batch_size",
+                    self.extra_config.get("preload_message_batch_size", 1),
+                )
+            )
+            self._manager = SharedStorageOffloadingManager(
+                self.file_mapper, preload_batch_size=preload_batch_size
+            )
         return self._manager
 
     def get_handlers(
@@ -484,6 +527,7 @@ SharedStorageOffloadingSpec = XNvmeOffloadingSpec
 
 __all__ = [
     "SharedStorageLoadStoreSpec",
+    "SharedStoragePreloadMessage",
     "SharedStorageOffloadingSpec",
     "XNvmeOffloadingSpec",
 ]
