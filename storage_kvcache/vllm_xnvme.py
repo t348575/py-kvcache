@@ -33,7 +33,7 @@ from .xnvme_file import XNvmeFileStore
 
 logger = init_logger("vllm.storage_kvcache.vllm_xnvme")
 
-Sample = tuple[int, int, int]
+Sample = tuple[int, int, int] | tuple[int, int, int, str]
 
 
 def _expand_block_ids(

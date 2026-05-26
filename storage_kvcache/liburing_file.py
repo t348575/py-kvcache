@@ -148,6 +148,7 @@ class _AlignedIoBuffer:
 class _TimedIoResult:
     start_ns: int
     duration_ns: int
+    read_source: str = "regular_load"
 
 
 @dataclass(frozen=True)
@@ -168,6 +169,7 @@ class _QueuedRead:
     buffer: _AlignedIoBuffer | None
     target: np.ndarray[Any, np.dtype[np.uint8]]
     consumer: Callable[[int, np.ndarray[Any, np.dtype[np.uint8]]], None] | None
+    read_source: str
 
 
 def _align_up(value: int, alignment: int) -> int:
@@ -621,12 +623,7 @@ class LiburingFileStore:
     def _read_file(self, path: str, buffer: _AlignedIoBuffer) -> None:
         fd = self.open_fd(path, write=False, create=False, truncate=False)
         try:
-            with profile_scope(
-                "storage_kvcache.liburing.file_read",
-                "fs",
-                args={"io_size": self.io_size},
-            ):
-                self._run_file_io(fd, buffer, path=path, write=False)
+            self._run_file_io(fd, buffer, path=path, write=False)
         finally:
             with profile_scope("storage_kvcache.liburing.close_fd", "fs"):
                 os.close(fd)
@@ -714,6 +711,7 @@ class LiburingFileStore:
         consumer: Callable[[int, np.ndarray[Any, np.dtype[np.uint8]]], None],
         *,
         direct_targets: list[np.ndarray[Any, np.dtype[np.uint8]] | None] | None = None,
+        read_source: str = "regular_load",
     ) -> dict[int, _QueuedRead]:
         if len(paths) != len(slot_indexes):
             raise ValueError("paths and slot_indexes must have the same length")
@@ -758,6 +756,7 @@ class LiburingFileStore:
                     buffer=buffer,
                     target=target,
                     consumer=read_consumer,
+                    read_source=read_source,
                 )
             ring.submit_pending()
             return queued
@@ -789,6 +788,7 @@ class LiburingFileStore:
             return item.slot_index, _TimedIoResult(
                 start_ns=item.start_ns,
                 duration_ns=duration_ns,
+                read_source=item.read_source,
             )
         finally:
             os.close(item.fd)

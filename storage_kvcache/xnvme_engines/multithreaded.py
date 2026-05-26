@@ -23,6 +23,10 @@ from simple_profiler import profile_scope, profiler
 
 from ..file_mapper import FileMapper
 from ..liburing_file import LiburingFileStore
+from ..preload_policy import (
+    preload_submission_capacity,
+    resolve_preload_target_io_depth,
+)
 from ..vllm_xnvme import (
     ParsedKvLayout,
     Sample,
@@ -97,6 +101,7 @@ class _PreloadedBlockState:
     block_hash: bytes
     slot_index: int
     file_io_samples: list[Sample]
+    io_depth_pending: bool = True
     future: Future[None] | None = None
     copy_future: Future[_PendingCudaCopy] | None = None
     dst_blocks: np.ndarray | None = None
@@ -155,6 +160,11 @@ class MultithreadedXNvmeOffloadingHandler(OffloadingHandler):
         )
         self._io_queue_cv = threading.Condition()
         self._available_io_queue_slots = self._io_queue_depth
+        self._preload_target_io_depth = resolve_preload_target_io_depth(
+            getattr(self.file_store.config, "preload_target_io_depth", None),
+            self._io_queue_depth,
+        )
+        self._pending_io_depth_reservations = 0
         self._transfer_jobs: dict[int, tuple[int, str, str, str]] = {}
         self._profiled_jobs: set[int] = set()
         self._preloaded_blocks: dict[bytes, _PreloadedBlockState] = {}
@@ -238,6 +248,25 @@ class MultithreadedXNvmeOffloadingHandler(OffloadingHandler):
             self._available_staging_slots.remove(slot_index)
             return slot_index
 
+    def _try_reserve_staging_slots(self, count: int) -> list[int] | None:
+        if count <= 0:
+            return []
+        with self._staging_cv:
+            if len(self._available_staging_slots) < count:
+                return None
+            slots = sorted(self._available_staging_slots)[:count]
+            self._available_staging_slots.difference_update(slots)
+            return slots
+
+    def _reserve_available_staging_slots(self, max_count: int) -> list[int]:
+        if max_count <= 0:
+            return []
+        with self._staging_cv:
+            count = min(max_count, len(self._available_staging_slots))
+            slots = sorted(self._available_staging_slots)[:count]
+            self._available_staging_slots.difference_update(slots)
+            return slots
+
     def _reserve_io_queue_slots(self, count: int, *, wait: bool) -> int:
         if count <= 0:
             return 0
@@ -257,6 +286,26 @@ class MultithreadedXNvmeOffloadingHandler(OffloadingHandler):
                 self._available_io_queue_slots = self._io_queue_depth
             self._io_queue_cv.notify_all()
 
+    def _reserved_io_depth(self) -> int:
+        with self._io_queue_cv:
+            return self._io_queue_depth - self._available_io_queue_slots
+
+    def _mark_preload_io_queued(self, states: list[_PreloadedBlockState]) -> None:
+        released_pending = 0
+        with self._lock:
+            for state in states:
+                if state.io_depth_pending:
+                    state.io_depth_pending = False
+                    released_pending += 1
+            self._pending_io_depth_reservations = max(
+                0, self._pending_io_depth_reservations - released_pending
+            )
+
+    def _release_pending_preload_io(
+        self, states: list[_PreloadedBlockState]
+    ) -> None:
+        self._mark_preload_io_queued(states)
+
     def handle_worker_message(self, message: Any) -> bool:
         if not isinstance(message, SharedStoragePreloadMessage):
             return False
@@ -264,7 +313,8 @@ class MultithreadedXNvmeOffloadingHandler(OffloadingHandler):
         supported = isinstance(self.file_store, LiburingFileStore)
         submitted = 0
         if supported:
-            submitted = self._submit_preload_batch(message.block_hashes)
+            if self._can_submit_preload_batch(message.block_hashes):
+                submitted = self._submit_preload_batch(message.block_hashes)
         if profiler._active:
             profiler.add_event(
                 "storage_kvcache.engine.handle_preload_message",
@@ -279,28 +329,71 @@ class MultithreadedXNvmeOffloadingHandler(OffloadingHandler):
             )
         return supported
 
+    def _can_submit_preload_batch(self, block_hashes: tuple[bytes, ...]) -> bool:
+        reserved_io_depth = self._reserved_io_depth()
+        with self._lock:
+            unique_missing = {
+                block_hash
+                for block_hash in block_hashes
+                if block_hash not in self._preloaded_blocks
+            }
+            requested_blocks = len(unique_missing)
+            if requested_blocks == 0:
+                return True
+            capacity = preload_submission_capacity(
+                target_io_depth=self._preload_target_io_depth,
+                reserved_io_depth=reserved_io_depth,
+                pending_io_depth_reservations=self._pending_io_depth_reservations,
+                requested_blocks=requested_blocks,
+            )
+        if capacity < requested_blocks:
+            return False
+
+        with self._staging_cv:
+            return len(self._available_staging_slots) >= requested_blocks
+
     def _submit_preload_batch(self, block_hashes: tuple[bytes, ...]) -> int:
         submit_start_ns = time.perf_counter_ns()
         states: list[_PreloadedBlockState] = []
         duplicate_count = 0
         no_slot_count = 0
+        target_depth_rejected_count = 0
+        reserved_io_depth = self._reserved_io_depth()
+        system_io_depth = reserved_io_depth
 
         with self._lock:
+            pending_io_depth_reservations = self._pending_io_depth_reservations
+            system_io_depth = reserved_io_depth + pending_io_depth_reservations
+            unique_missing: list[bytes] = []
+            seen_missing: set[bytes] = set()
             for block_hash in block_hashes:
-                existing = self._preloaded_blocks.get(block_hash)
-                if existing is not None:
+                if block_hash in self._preloaded_blocks or block_hash in seen_missing:
                     duplicate_count += 1
                     continue
-                slot_index = self._try_reserve_staging_slot()
-                if slot_index is None:
-                    no_slot_count += 1
-                    continue
+                seen_missing.add(block_hash)
+                unique_missing.append(block_hash)
+            capacity = preload_submission_capacity(
+                target_io_depth=self._preload_target_io_depth,
+                reserved_io_depth=reserved_io_depth,
+                pending_io_depth_reservations=pending_io_depth_reservations,
+                requested_blocks=len(unique_missing),
+            )
+            if capacity < len(unique_missing):
+                target_depth_rejected_count = len(unique_missing)
+                unique_missing = []
+            slot_indexes = self._try_reserve_staging_slots(len(unique_missing))
+            if slot_indexes is None:
+                no_slot_count = len(unique_missing)
+                unique_missing = []
+                slot_indexes = []
+            for block_hash, slot_index in zip(unique_missing, slot_indexes):
                 state = _PreloadedBlockState(
                     block_hash=block_hash,
                     slot_index=slot_index,
                     file_io_samples=[],
                 )
                 self._preloaded_blocks[block_hash] = state
+                self._pending_io_depth_reservations += 1
                 states.append(state)
 
         if duplicate_count and profiler._active:
@@ -319,6 +412,18 @@ class MultithreadedXNvmeOffloadingHandler(OffloadingHandler):
                 time.perf_counter_ns() - submit_start_ns,
                 args={"num_blocks": no_slot_count},
             )
+        if target_depth_rejected_count and profiler._active:
+            profiler.add_event(
+                "storage_kvcache.engine.preload_target_io_depth_rejected",
+                "kv_offload",
+                submit_start_ns,
+                time.perf_counter_ns() - submit_start_ns,
+                args={
+                    "num_blocks": target_depth_rejected_count,
+                    "target_io_depth": self._preload_target_io_depth,
+                    "system_io_depth": system_io_depth,
+                },
+            )
 
         if not states:
             return 0
@@ -331,6 +436,7 @@ class MultithreadedXNvmeOffloadingHandler(OffloadingHandler):
             ):
                 future = self._preload_executor.submit(self._run_preload_batch, states)
         except BaseException as exc:
+            self._release_pending_preload_io(states)
             release_slots: list[int] = []
             with self._lock:
                 for state in states:
@@ -352,7 +458,11 @@ class MultithreadedXNvmeOffloadingHandler(OffloadingHandler):
                 "kv_offload",
                 submit_start_ns,
                 time.perf_counter_ns() - submit_start_ns,
-                args={"num_blocks": len(states)},
+                args={
+                    "num_blocks": len(states),
+                    "target_io_depth": self._preload_target_io_depth,
+                    "system_io_depth": system_io_depth,
+                },
             )
         return len(states)
 
@@ -381,6 +491,7 @@ class MultithreadedXNvmeOffloadingHandler(OffloadingHandler):
                     args={"num_blocks": len(states)},
                 )
         except BaseException as exc:
+            self._release_pending_preload_io(states)
             failed_states: list[_PreloadedBlockState] = []
             for state in states:
                 with state.condition:
@@ -683,14 +794,23 @@ class MultithreadedXNvmeOffloadingHandler(OffloadingHandler):
         max_queued_reads: int,
         drain_ready: Any | None = None,
         wait_when_idle: Any | None = None,
+        on_reads_queued: Any | None = None,
+        read_source: str = "regular_load",
+        owned_slot_indexes: set[int] | None = None,
         reuse_slots: bool = True,
     ) -> None:
         total_file_count = len(block_hashes)
         if total_file_count == 0:
             return
-        required_slots = max_queued_reads if reuse_slots else total_file_count
-        if len(slot_indexes) < required_slots:
+        if reuse_slots:
+            if not slot_indexes and drain_ready is None:
+                raise ValueError("slot_indexes does not cover requested reads")
+        elif len(slot_indexes) < total_file_count:
             raise ValueError("slot_indexes does not cover requested reads")
+        if owned_slot_indexes is None:
+            owned_slot_indexes = set(slot_indexes)
+        else:
+            owned_slot_indexes.update(slot_indexes)
 
         queued_reads: dict[int, Any] = {}
         slot_to_file_index: dict[int, int] = {}
@@ -705,6 +825,7 @@ class MultithreadedXNvmeOffloadingHandler(OffloadingHandler):
             nonlocal next_file_index
             if drain_ready is not None:
                 drain_ready(free_slots)
+                owned_slot_indexes.update(free_slots)
             if next_file_index >= total_file_count:
                 return
             available = max_queued_reads - len(queued_reads)
@@ -726,6 +847,7 @@ class MultithreadedXNvmeOffloadingHandler(OffloadingHandler):
             paths: list[str] = []
             read_slot_indexes: list[int] = []
             direct_targets: list[np.ndarray[Any, np.dtype[np.uint8]] | None] = []
+            queued_file_indexes: list[int] = []
             while available > 0 and next_file_index < total_file_count:
                 file_index = next_file_index
                 if reuse_slots:
@@ -734,6 +856,7 @@ class MultithreadedXNvmeOffloadingHandler(OffloadingHandler):
                     slot_index = free_slots.pop()
                 else:
                     slot_index = slot_indexes[file_index]
+                owned_slot_indexes.add(slot_index)
                 block_hash = block_hashes[file_index]
                 slot_to_file_index[slot_index] = file_index
                 queued_io_slots[slot_index] = 1
@@ -747,6 +870,7 @@ class MultithreadedXNvmeOffloadingHandler(OffloadingHandler):
                         alignment=self.file_store.config.io_alignment,
                     )
                 direct_targets.append(direct_target)
+                queued_file_indexes.append(file_index)
                 next_file_index += 1
                 available -= 1
 
@@ -761,8 +885,11 @@ class MultithreadedXNvmeOffloadingHandler(OffloadingHandler):
                         read_slot_indexes,
                         unpack_storage_slot,
                         direct_targets=direct_targets,
+                        read_source=read_source,
                     )
                 )
+                if on_reads_queued is not None:
+                    on_reads_queued(queued_file_indexes)
 
         try:
             submit_reads()
@@ -778,6 +905,7 @@ class MultithreadedXNvmeOffloadingHandler(OffloadingHandler):
                 if completed_read is None:
                     if not queued_reads and wait_when_idle is not None:
                         wait_when_idle(free_slots)
+                        owned_slot_indexes.update(free_slots)
                     else:
                         time.sleep(0)
                     continue
@@ -789,6 +917,7 @@ class MultithreadedXNvmeOffloadingHandler(OffloadingHandler):
                         result.start_ns,
                         result.duration_ns,
                         self.layout.storage_block_bytes,
+                        getattr(result, "read_source", read_source),
                     )
                 )
                 file_index = slot_to_file_index.pop(slot_index)
@@ -808,6 +937,8 @@ class MultithreadedXNvmeOffloadingHandler(OffloadingHandler):
         *,
         slot_indexes: list[int],
         preload_states: list[_PreloadedBlockState] | None = None,
+        extra_drain_ready: Any | None = None,
+        allow_dynamic_slots: bool = False,
         release_slots: bool = True,
     ) -> int:
         total_file_count = len(block_hashes)
@@ -818,27 +949,30 @@ class MultithreadedXNvmeOffloadingHandler(OffloadingHandler):
         if preload_states is not None and len(preload_states) != total_file_count:
             raise ValueError("preload states do not match block hashes")
 
+        slot_capacity = self._io_queue_depth if allow_dynamic_slots else len(slot_indexes)
         max_queued_reads = max(
             1,
             min(
-                len(slot_indexes),
+                slot_capacity,
                 total_file_count,
                 self._io_queue_depth,
             ),
         )
         pending_copies: dict[int, _PendingCudaCopy] = {}
+        owned_slot_indexes = set(slot_indexes)
 
         def drain_ready_copies(
             free_slots: list[int], *, force: bool = False
         ) -> None:
-            if preload_states is not None:
-                return
+            if preload_states is None:
+                for slot_index, pending in list(pending_copies.items()):
+                    if force or self._cuda_copy_done(pending):
+                        self._complete_cuda_copy(pending, cuda_copy_samples)
+                        pending_copies.pop(slot_index)
+                        free_slots.append(slot_index)
 
-            for slot_index, pending in list(pending_copies.items()):
-                if force or self._cuda_copy_done(pending):
-                    self._complete_cuda_copy(pending, cuda_copy_samples)
-                    pending_copies.pop(slot_index)
-                    free_slots.append(slot_index)
+            if extra_drain_ready is not None:
+                extra_drain_ready(free_slots, force=force)
 
         def on_read_complete(slot_index: int, file_index: int) -> None:
             if preload_states is not None:
@@ -868,13 +1002,24 @@ class MultithreadedXNvmeOffloadingHandler(OffloadingHandler):
                 max_queued_reads=max_queued_reads,
                 drain_ready=drain_ready_copies,
                 wait_when_idle=partial(drain_ready_copies, force=True),
+                on_reads_queued=(
+                    lambda file_indexes: self._mark_preload_io_queued(
+                        [preload_states[file_index] for file_index in file_indexes]
+                    )
+                    if preload_states is not None
+                    else None
+                ),
+                read_source="preload" if preload_states is not None else "regular_load",
+                owned_slot_indexes=owned_slot_indexes,
                 reuse_slots=preload_states is None,
             )
             while pending_copies:
-                drain_ready_copies([], force=True)
+                released_slots: list[int] = []
+                drain_ready_copies(released_slots, force=True)
+                owned_slot_indexes.update(released_slots)
         finally:
             if release_slots:
-                self._release_staging_slots(slot_indexes)
+                self._release_staging_slots(sorted(owned_slot_indexes))
 
         return total_file_count * self.layout.storage_block_bytes
 
@@ -1168,6 +1313,7 @@ class MultithreadedXNvmeOffloadingHandler(OffloadingHandler):
                             result.start_ns,
                             result.duration_ns,
                             self.layout.storage_block_bytes,
+                            "regular_load",
                         )
                     )
                     pending_copies[slot_index] = pending_copy
@@ -1334,6 +1480,173 @@ class MultithreadedXNvmeOffloadingHandler(OffloadingHandler):
                 args={"num_blocks": len(states_by_file_index)},
             )
 
+    def _load_regular_blocks_while_copying_preloads(
+        self,
+        block_hashes: list[bytes],
+        dst_blocks_per_file: list[np.ndarray],
+        missing_file_indexes: list[int],
+        states_by_file_index: dict[int, _PreloadedBlockState],
+        file_io_samples: list[Sample],
+        cuda_copy_samples: list[Sample],
+    ) -> None:
+        wait_start_ns = time.perf_counter_ns()
+        pending_states = list(states_by_file_index.values())
+        release_slots = {state.slot_index for state in pending_states}
+        launch_futures: dict[Future[_PendingCudaCopy], list[_PreloadedBlockState]] = {}
+        pending_copy_batches: list[
+            tuple[_PendingCudaCopy, list[_PreloadedBlockState]]
+        ] = []
+
+        def finish_state(
+            state: _PreloadedBlockState, free_slots: list[int] | None
+        ) -> None:
+            pending_states.remove(state)
+            file_io_samples.extend(state.file_io_samples)
+            if state.slot_index not in release_slots:
+                return
+            release_slots.remove(state.slot_index)
+            if free_slots is None:
+                self._release_staging_slots([state.slot_index])
+            else:
+                free_slots.append(state.slot_index)
+
+        def submit_ready_copy_batches() -> bool:
+            ready_states: list[_PreloadedBlockState] = []
+            for state in pending_states:
+                with state.condition:
+                    if state.failed is not None:
+                        raise state.failed
+                    if (
+                        state.done_reading
+                        and state.dst_blocks is not None
+                        and state.copy_future is None
+                        and state.pending_copy is None
+                        and not state.done_copying
+                    ):
+                        ready_states.append(state)
+
+            submitted = False
+            batch_size = self._preloaded_copy_batch_size
+            for start in range(0, len(ready_states), batch_size):
+                batch_states = ready_states[start : start + batch_size]
+                items = [
+                    (state.slot_index, state.dst_blocks)
+                    for state in batch_states
+                    if state.dst_blocks is not None
+                ]
+                if not items:
+                    continue
+                future = self._pipeline_executor.submit(
+                    self._launch_preloaded_copy_batch, items
+                )
+                for state in batch_states:
+                    with state.condition:
+                        state.copy_future = future
+                launch_futures[future] = batch_states
+                submitted = True
+            return submitted
+
+        def drain_copy_launches() -> bool:
+            made_progress = False
+            for future, batch_states in list(launch_futures.items()):
+                if not future.done():
+                    continue
+                try:
+                    pending = future.result()
+                except BaseException as exc:
+                    for state in batch_states:
+                        with state.condition:
+                            state.failed = exc
+                            state.copy_future = None
+                            state.condition.notify_all()
+                    raise
+                launch_futures.pop(future, None)
+                for state in batch_states:
+                    with state.condition:
+                        state.copy_future = None
+                        state.pending_copy = pending
+                        state.condition.notify_all()
+                pending_copy_batches.append((pending, batch_states))
+                made_progress = True
+            return made_progress
+
+        def drain_pending_copy_batches(
+            free_slots: list[int] | None, *, force: bool = False
+        ) -> bool:
+            made_progress = False
+            for pending, batch_states in list(pending_copy_batches):
+                if not force and not self._cuda_copy_done(pending):
+                    continue
+                self._complete_cuda_copy(pending, cuda_copy_samples)
+                pending_copy_batches[:] = [
+                    item for item in pending_copy_batches if item[0] is not pending
+                ]
+                for state in list(batch_states):
+                    with state.condition:
+                        state.pending_copy = None
+                        state.done_copying = True
+                        state.condition.notify_all()
+                    if state in pending_states:
+                        finish_state(state, free_slots)
+                made_progress = True
+            return made_progress
+
+        def drain_preloaded_copies(
+            free_slots: list[int] | None, *, force: bool = False
+        ) -> bool:
+            made_progress = submit_ready_copy_batches()
+            made_progress = drain_copy_launches() or made_progress
+            made_progress = (
+                drain_pending_copy_batches(free_slots, force=force) or made_progress
+            )
+            return made_progress
+
+        def wait_for_preloaded_copies() -> None:
+            while pending_states:
+                waiting_for_reads = False
+                for state in list(pending_states):
+                    with state.condition:
+                        if state.failed is not None:
+                            raise state.failed
+                        if not state.done_reading:
+                            waiting_for_reads = True
+
+                made_progress = drain_preloaded_copies(None)
+                if not pending_states:
+                    break
+                if made_progress:
+                    continue
+                if not waiting_for_reads and not launch_futures:
+                    drain_pending_copy_batches(None, force=True)
+                    continue
+                time.sleep(0.001)
+
+        try:
+            self._load_batched_io_uring_indexes(
+                block_hashes,
+                dst_blocks_per_file,
+                missing_file_indexes,
+                file_io_samples,
+                cuda_copy_samples,
+                extra_drain_ready=drain_preloaded_copies,
+                reserve_available_only=True,
+            )
+            wait_for_preloaded_copies()
+        finally:
+            self._release_staging_slots(sorted(release_slots))
+
+        if profiler._active:
+            profiler.add_event(
+                "storage_kvcache.engine.wait_preloaded_copies",
+                "kv_offload",
+                wait_start_ns,
+                time.perf_counter_ns() - wait_start_ns,
+                args={
+                    "num_blocks": len(states_by_file_index),
+                    "interleaved_regular_loads": True,
+                },
+            )
+
     def _load_with_partial_preloads(
         self,
         src_spec: SharedStorageLoadStoreSpec,
@@ -1370,19 +1683,27 @@ class MultithreadedXNvmeOffloadingHandler(OffloadingHandler):
                 },
             )
 
-        self._copy_preloaded_blocks(
-            states_by_file_index,
-            dst_blocks_per_file,
-            file_io_samples,
-            cuda_copy_samples,
-        )
-        self._load_batched_io_uring_indexes(
-            src_spec.block_hashes,
-            dst_blocks_per_file,
-            missing_file_indexes,
-            file_io_samples,
-            cuda_copy_samples,
-        )
+        for file_index, state in states_by_file_index.items():
+            with state.condition:
+                state.dst_blocks = dst_blocks_per_file[file_index]
+                state.condition.notify_all()
+
+        if missing_file_indexes:
+            self._load_regular_blocks_while_copying_preloads(
+                src_spec.block_hashes,
+                dst_blocks_per_file,
+                missing_file_indexes,
+                states_by_file_index,
+                file_io_samples,
+                cuda_copy_samples,
+            )
+        else:
+            self._copy_preloaded_blocks(
+                states_by_file_index,
+                dst_blocks_per_file,
+                file_io_samples,
+                cuda_copy_samples,
+            )
 
         if profiler._active:
             profiler.add_event(
@@ -1431,6 +1752,9 @@ class MultithreadedXNvmeOffloadingHandler(OffloadingHandler):
         file_indexes: list[int],
         file_io_samples: list[Sample],
         cuda_copy_samples: list[Sample],
+        *,
+        extra_drain_ready: Any | None = None,
+        reserve_available_only: bool = False,
     ) -> int:
         total_file_count = len(file_indexes)
         if total_file_count == 0:
@@ -1441,15 +1765,19 @@ class MultithreadedXNvmeOffloadingHandler(OffloadingHandler):
         selected_dst_blocks = [
             dst_blocks_per_file[file_index] for file_index in file_indexes
         ]
-        slots = self._reserve_staging_slots(
-            min(self._io_queue_depth, total_file_count)
-        )
+        max_slots = min(self._io_queue_depth, total_file_count)
+        if reserve_available_only:
+            slots = self._reserve_available_staging_slots(max_slots)
+        else:
+            slots = self._reserve_staging_slots(max_slots)
         return self._run_batched_io_uring_pipeline(
             selected_block_hashes,
             selected_dst_blocks,
             file_io_samples,
             cuda_copy_samples,
             slot_indexes=slots,
+            extra_drain_ready=extra_drain_ready,
+            allow_dynamic_slots=reserve_available_only,
         )
 
     def _emit_profile_events(
@@ -1470,9 +1798,9 @@ class MultithreadedXNvmeOffloadingHandler(OffloadingHandler):
 
         def merged_duration_ns(samples: list[Sample]) -> int:
             intervals = sorted(
-                (start_ns, start_ns + duration_ns)
-                for start_ns, duration_ns, _sample_num_bytes in samples
-                if duration_ns > 0
+                (sample[0], sample[0] + sample[1])
+                for sample in samples
+                if sample[1] > 0
             )
             if not intervals:
                 return 0
@@ -1537,9 +1865,20 @@ class MultithreadedXNvmeOffloadingHandler(OffloadingHandler):
                     ),
                 },
             )
-        for sample_idx, (start_ns, duration_ns, sample_num_bytes) in enumerate(
-            file_io_samples
-        ):
+        for sample_idx, sample in enumerate(file_io_samples):
+            start_ns, duration_ns, sample_num_bytes = sample[:3]
+            file_args = {
+                "req_id": req_id,
+                "num_bytes": sample_num_bytes,
+                "bw_GBps": round(
+                    (sample_num_bytes / duration_ns) if duration_ns > 0 else 0.0,
+                    3,
+                ),
+            }
+            if not is_store:
+                file_args["read_source"] = (
+                    sample[3] if len(sample) > 3 else "regular_load"
+                )
             profiler.add_event(
                 name=(
                     f"file_{'write' if is_store else 'read'}"
@@ -1549,14 +1888,7 @@ class MultithreadedXNvmeOffloadingHandler(OffloadingHandler):
                 start_ns=start_ns,
                 duration_ns=duration_ns,
                 tid=profile_tid,
-                args={
-                    "req_id": req_id,
-                    "num_bytes": sample_num_bytes,
-                    "bw_GBps": round(
-                        (sample_num_bytes / duration_ns) if duration_ns > 0 else 0.0,
-                        3,
-                    ),
-                },
+                args=file_args,
             )
         self._profiled_jobs.add(job_id)
 

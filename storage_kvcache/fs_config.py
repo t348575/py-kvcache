@@ -47,6 +47,7 @@ class SharedFileConfig:
     sync_on_store: bool = False
     parallel_files: int | None = None
     uring_depth: int | None = None
+    preload_target_io_depth: int | None = None
     engine: str = "multithreaded"
     create_mode: int | None = None
     io_alignment: int = 4096
@@ -102,6 +103,12 @@ class SharedFileConfig:
             extra_config.get("uring_depth", extra_config.get("io_uring_depth")),
             field_name="uring_depth",
         )
+        preload_target_io_depth = _coerce_int(
+            extra_config.get("preload_target_io_depth"),
+            field_name="preload_target_io_depth",
+        )
+        if preload_target_io_depth is not None and preload_target_io_depth < 0:
+            raise ValueError("preload_target_io_depth must be non-negative")
         engine = _coerce_str(
             extra_config.get("engine", resolve("engine")),
             field_name="xnvme_engine",
@@ -113,6 +120,7 @@ class SharedFileConfig:
             sync_on_store=False if sync_on_store is None else sync_on_store,
             parallel_files=parallel_files,
             uring_depth=uring_depth,
+            preload_target_io_depth=preload_target_io_depth,
             engine=engine or "multithreaded",
             create_mode=_coerce_int(
                 resolve("create_mode"), field_name="xnvme_create_mode"
