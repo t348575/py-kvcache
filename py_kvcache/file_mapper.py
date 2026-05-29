@@ -18,7 +18,7 @@ class FileMapper:
         pcp_size: int,
         rank: int,
         dtype: str,
-    ):
+    ) -> None:
         self.base_path = os.path.join(
             root_dir,
             model_name,
