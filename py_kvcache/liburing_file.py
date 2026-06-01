@@ -147,7 +147,6 @@ class LiburingRing:
             raise ValueError("iodepth must be positive")
         self.depth = depth
         self.ring_id = ring_id
-        self._empty_polls = 0
         self._params = _IoUringParams()
         fd = _LIBC.syscall(
             ctypes.c_long(_NR_IO_URING_SETUP),
@@ -228,18 +227,6 @@ class LiburingRing:
         sqe.len = nbytes
         sqe.user_data = user_data
         self._commit_sqe(index, tail)
-        add_event(
-            "py_kvcache.liburing.queue_rw",
-            "fs",
-            now_ns(),
-            0,
-            args={
-                "ring_id": self.ring_id,
-                "direction": "write" if write else "read",
-                "pending_submit": self._pending_submit,
-                "nbytes": nbytes,
-            },
-        )
 
     def queue_openat(
         self,
@@ -266,17 +253,6 @@ class LiburingRing:
         sqe.rw_flags = open_flags
         sqe.user_data = user_data
         self._commit_sqe(index, tail)
-        add_event(
-            "py_kvcache.liburing.queue_openat",
-            "fs",
-            now_ns(),
-            0,
-            args={
-                "ring_id": self.ring_id,
-                "pending_submit": self._pending_submit,
-                "open_flags": open_flags,
-            },
-        )
 
     def queue_close(self, *, user_data: int, fd: int) -> None:
         """Queue an async ``close``. Completion result is ignored by the reactor."""
@@ -292,8 +268,6 @@ class LiburingRing:
         self._enter(self._pending_submit, 0)
 
     def _enter(self, to_submit: int, min_complete: int) -> None:
-        submit_start_ns = now_ns()
-        pending_submit = self._pending_submit
         flags = _IORING_ENTER_GETEVENTS if min_complete > 0 else 0
         submitted = _LIBC.syscall(
             ctypes.c_long(_NR_IO_URING_ENTER),
@@ -307,18 +281,6 @@ class LiburingRing:
         if submitted < 0:
             err = ctypes.get_errno()
             raise OSError(err, "io_uring_enter failed")
-        add_event(
-            "py_kvcache.liburing.enter_submit",
-            "fs",
-            submit_start_ns,
-            now_ns() - submit_start_ns,
-            args={
-                "ring_id": self.ring_id,
-                "pending": pending_submit,
-                "submitted": int(submitted),
-                "min_complete": min_complete,
-            },
-        )
         self._pending_submit = max(0, self._pending_submit - int(submitted))
 
     def poll_all(self) -> list[tuple[int, int]]:
@@ -331,9 +293,7 @@ class LiburingRing:
         head = int(self._cq_head[0])
         tail = int(self._cq_tail[0])
         if head == tail:
-            self._empty_polls += 1
             return []
-        poll_start_ns = now_ns()
         mask = int(self._cq_mask[0])
         completions: list[tuple[int, int]] = []
         while head != tail:
@@ -342,22 +302,6 @@ class LiburingRing:
             completions.append((int(cqe.user_data), int(cqe.res)))
             head += 1
         self._cq_head[0] = head
-        if self._empty_polls:
-            add_event(
-                "py_kvcache.liburing.poll_all_empty",
-                "fs",
-                poll_start_ns,
-                0,
-                args={"ring_id": self.ring_id, "empty_polls": self._empty_polls},
-            )
-            self._empty_polls = 0
-        add_event(
-            "py_kvcache.liburing.poll_all_complete",
-            "fs",
-            poll_start_ns,
-            now_ns() - poll_start_ns,
-            args={"ring_id": self.ring_id, "count": len(completions)},
-        )
         return completions
 
     def close(self) -> None:
@@ -439,25 +383,10 @@ class DirectIoFileStore:
 
     def open_temp_write(self, final_path: str) -> tuple[int, str]:
         parent = os.path.dirname(final_path)
-        makedirs_start_ns = now_ns()
         os.makedirs(parent, exist_ok=True)
-        add_event(
-            "py_kvcache.file.makedirs",
-            "fs",
-            makedirs_start_ns,
-            now_ns() - makedirs_start_ns,
-        )
         temp_path = self._temp_path(final_path)
         flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_DIRECT
-        open_start_ns = now_ns()
         fd = os.open(temp_path, flags, DEFAULT_CREATE_MODE)
-        add_event(
-            "py_kvcache.file.open_write",
-            "fs",
-            open_start_ns,
-            now_ns() - open_start_ns,
-            args={"payload_bytes": self.payload_size, "io_bytes": self.io_size},
-        )
         return fd, temp_path
 
     def queue_read(
@@ -469,7 +398,6 @@ class DirectIoFileStore:
         slot: StagingSlot,
         io_array: np.ndarray | None = None,
     ) -> None:
-        start_ns = now_ns()
         array = io_array if io_array is not None else slot.array
         self._validate_io_array(array)
         ring.queue_rw(
@@ -478,17 +406,6 @@ class DirectIoFileStore:
             ptr=ctypes.c_void_p(array.ctypes.data),
             nbytes=self.io_size,
             write=False,
-        )
-        add_event(
-            "py_kvcache.file.queue_read",
-            "fs",
-            start_ns,
-            now_ns() - start_ns,
-            args={
-                "payload_bytes": self.payload_size,
-                "io_bytes": self.io_size,
-                "direct_staging": io_array is not None,
-            },
         )
 
     def queue_write(
@@ -500,7 +417,6 @@ class DirectIoFileStore:
         slot: StagingSlot,
         io_array: np.ndarray | None = None,
     ) -> None:
-        start_ns = now_ns()
         array = io_array if io_array is not None else slot.array
         self._validate_io_array(array)
         if io_array is None:
@@ -511,17 +427,6 @@ class DirectIoFileStore:
             ptr=ctypes.c_void_p(array.ctypes.data),
             nbytes=self.io_size,
             write=True,
-        )
-        add_event(
-            "py_kvcache.file.queue_write",
-            "fs",
-            start_ns,
-            now_ns() - start_ns,
-            args={
-                "payload_bytes": self.payload_size,
-                "io_bytes": self.io_size,
-                "direct_staging": io_array is not None,
-            },
         )
 
     def finish_write(self, *, fd: int, temp_path: str, final_path: str) -> bool:
@@ -535,7 +440,6 @@ class DirectIoFileStore:
                 now_ns() - sync_start_ns,
             )
         os.close(fd)
-        link_start_ns = now_ns()
         stored = False
         link_error: BaseException | None = None
         try:
@@ -545,31 +449,10 @@ class DirectIoFileStore:
             stored = False
         except BaseException as exc:
             link_error = exc
-        add_event(
-            "py_kvcache.file.link_temp",
-            "fs",
-            link_start_ns,
-            now_ns() - link_start_ns,
-            args={
-                "stored": stored,
-                "exception": type(link_error).__name__ if link_error else None,
-            },
-        )
-        unlink_start_ns = now_ns()
-        unlinked = False
         try:
             os.unlink(temp_path)
-            unlinked = True
         except FileNotFoundError:
             pass
-        finally:
-            add_event(
-                "py_kvcache.file.unlink_temp",
-                "fs",
-                unlink_start_ns,
-                now_ns() - unlink_start_ns,
-                args={"unlinked": unlinked},
-            )
         if link_error is not None:
             raise link_error
         if self.config.sync_on_store:
@@ -584,15 +467,7 @@ class DirectIoFileStore:
                 pass
         if temp_path is not None:
             try:
-                unlink_start_ns = now_ns()
                 os.unlink(temp_path)
-                add_event(
-                    "py_kvcache.file.unlink_temp",
-                    "fs",
-                    unlink_start_ns,
-                    now_ns() - unlink_start_ns,
-                    args={"cleanup": True},
-                )
             except FileNotFoundError:
                 pass
 

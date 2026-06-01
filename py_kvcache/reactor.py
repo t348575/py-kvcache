@@ -808,12 +808,6 @@ class IoReactor:
         final_path = self.file_mapper.get_file_name(block_hash)
         user_data = self._new_user_data()
         start_ns = now_ns()
-        add_event(
-            "py_kvcache.preload.open_read",
-            "kv_preload",
-            start_ns,
-            0,
-        )
         try:
             path_buf = self.file_store.queue_open_read(
                 self.ring, user_data=user_data, path=final_path
@@ -1121,14 +1115,6 @@ class TransferCoordinator:
             req_id=req_id,
             start_ns=start_ns,
         )
-        add_event(
-            "py_kvcache.transfer.submit",
-            "kv_offload",
-            start_ns,
-            now_ns() - start_ns,
-            tid=profile_tid,
-            args={"job_id": job_id, "req_id": req_id, "direction": profile.direction},
-        )
         future: "Future[int]" = Future()
         block_hashes = list(dst_spec.block_hashes)
         total = len(block_hashes)
@@ -1169,14 +1155,6 @@ class TransferCoordinator:
             profile_tid=profile_tid,
             req_id=req_id,
             start_ns=start_ns,
-        )
-        add_event(
-            "py_kvcache.transfer.submit",
-            "kv_offload",
-            start_ns,
-            now_ns() - start_ns,
-            tid=profile_tid,
-            args={"job_id": job_id, "req_id": req_id, "direction": profile.direction},
         )
         future: "Future[int]" = Future()
         block_hashes = list(src_spec.block_hashes)

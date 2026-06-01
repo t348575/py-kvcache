@@ -6,8 +6,6 @@ from typing import Any
 
 import numpy as np
 
-from .profiling import add_event, is_active, now_ns
-
 
 _LIBC = ctypes.CDLL(None, use_errno=True)
 _LIBC.posix_memalign.argtypes = [
@@ -100,21 +98,6 @@ class StagingPool:
         if not self._free:
             return None
         index = self._free.pop()
-        if is_active():
-            free_count = len(self._free)
-            now = now_ns()
-            add_event(
-                "py_kvcache.staging.reserve",
-                "kv_offload",
-                now,
-                0,
-                args={
-                    "slot_index": index,
-                    "waited": False,
-                    "free_slots": free_count,
-                    "total_slots": self.slot_count,
-                },
-            )
         return self._slots[index]
 
     def reserve(self) -> StagingSlot:
@@ -129,19 +112,6 @@ class StagingPool:
         if slot_index < 0 or slot_index >= self.slot_count:
             raise ValueError(f"invalid staging slot index {slot_index}")
         self._free.append(slot_index)
-        if is_active():
-            now = now_ns()
-            add_event(
-                "py_kvcache.staging.release",
-                "kv_offload",
-                now,
-                0,
-                args={
-                    "slot_index": slot_index,
-                    "free_slots": len(self._free),
-                    "total_slots": self.slot_count,
-                },
-            )
 
     def slot(self, slot_index: int) -> StagingSlot:
         if slot_index < 0 or slot_index >= self.slot_count:

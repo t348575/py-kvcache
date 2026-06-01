@@ -10,7 +10,7 @@ from typing import Any
 
 from .file_mapper import FileMapper
 from .fs_config import SharedFileConfig
-from .profiling import add_event, now_ns, profile_scope
+from .profiling import add_event, now_ns
 from .reactor import TransferCoordinator
 from .transfer import ParsedKvLayout
 
@@ -175,37 +175,17 @@ class SharedStorageOffloadingManager(OffloadingManager):
             if not preload_batch or not self.enable_preload:
                 preload_batch.clear()
                 return
-            send_start_ns = now_ns()
-            sent = False
-            num_blocks = len(preload_batch)
             if self._worker_message_sender is not None:
                 self._worker_message_sender(
                     SharedStoragePreloadMessage(tuple(preload_batch))
                 )
-                sent = True
             preload_batch.clear()
-            add_event(
-                "py_kvcache.manager.lookup_preload_message",
-                "kv_offload",
-                send_start_ns,
-                now_ns() - send_start_ns,
-                args={"sent": sent, "num_blocks": num_blocks},
-            )
 
         for key in keys:
             checked += 1
             block_hash = self._get_block_hash(key)
-            with profile_scope("py_kvcache.manager.file_name", "kv_offload"):
-                file_name = self.file_mapper.get_file_name(block_hash)
-            exists_start_ns = now_ns()
+            file_name = self.file_mapper.get_file_name(block_hash)
             exists = os.path.exists(file_name)
-            add_event(
-                "py_kvcache.manager.lookup_exists_one",
-                "kv_offload",
-                exists_start_ns,
-                now_ns() - exists_start_ns,
-                args={"hit": exists, "checked": checked},
-            )
             if not exists:
                 break
             hit_count += 1
@@ -225,15 +205,7 @@ class SharedStorageOffloadingManager(OffloadingManager):
         return hit_count
 
     def prepare_load(self, keys: Iterable[OffloadKey]) -> LoadStoreSpec:
-        start_ns = now_ns()
         block_hashes = [self._get_block_hash(key) for key in keys]
-        add_event(
-            "py_kvcache.manager.prepare_load",
-            "kv_offload",
-            start_ns,
-            now_ns() - start_ns,
-            args={"num_keys": len(block_hashes)},
-        )
         return SharedStorageLoadStoreSpec(block_hashes)
 
     def touch(self, keys: Iterable[OffloadKey]) -> None:
@@ -251,17 +223,8 @@ class SharedStorageOffloadingManager(OffloadingManager):
         for key in keys:
             checked += 1
             block_hash = self._get_block_hash(key)
-            with profile_scope("py_kvcache.manager.file_name", "kv_offload"):
-                file_name = self.file_mapper.get_file_name(block_hash)
-            exists_start_ns = now_ns()
+            file_name = self.file_mapper.get_file_name(block_hash)
             exists = os.path.exists(file_name)
-            add_event(
-                "py_kvcache.manager.prepare_store_exists_one",
-                "kv_offload",
-                exists_start_ns,
-                now_ns() - exists_start_ns,
-                args={"exists": exists, "checked": checked},
-            )
             if exists:
                 continue
             keys_to_store.append(key)
@@ -303,24 +266,9 @@ class NoopSharedStorageOffloadingHandler(OffloadingHandler):
         self.is_shutdown = False
 
     def handle_worker_message(self, message: Any) -> bool:
-        start_ns = now_ns()
         if isinstance(message, SharedStoragePreloadMessage):
             self.coordinator.submit_preload(list(message.block_hashes))
-            add_event(
-                "py_kvcache.handler.worker_message",
-                "kv_offload",
-                start_ns,
-                now_ns() - start_ns,
-                args={"accepted": True, "num_hashes": len(message.block_hashes)},
-            )
             return True
-        add_event(
-            "py_kvcache.handler.worker_message",
-            "kv_offload",
-            start_ns,
-            now_ns() - start_ns,
-            args={"accepted": False, "message_type": type(message).__name__},
-        )
         return False
 
     def transfer_async(
@@ -330,7 +278,6 @@ class NoopSharedStorageOffloadingHandler(OffloadingHandler):
         profile_tid: str = "kv_transfer",
         req_id: str = "",
     ) -> bool:
-        start_ns = now_ns()
         if self.is_shutdown:
             raise RuntimeError("py-kvcache handler is shut down")
         if job_id in self._active or job_id in self._finished:
@@ -376,24 +323,9 @@ class NoopSharedStorageOffloadingHandler(OffloadingHandler):
             )
 
         self._active[job_id] = (future, started, transfer_type)
-        add_event(
-            "py_kvcache.handler.transfer_async",
-            "kv_offload",
-            start_ns,
-            now_ns() - start_ns,
-            tid=profile_tid,
-            args={
-                "job_id": job_id,
-                "req_id": req_id,
-                "direction": direction,
-                "num_hashes": num_hashes,
-            },
-        )
         return True
 
     def get_finished(self) -> list[TransferResult]:
-        start_ns = now_ns()
-        active_count = len(self._active)
         for job_id, (future, started, transfer_type) in list(self._active.items()):
             if not future.done():
                 continue
@@ -406,13 +338,6 @@ class NoopSharedStorageOffloadingHandler(OffloadingHandler):
             self._active.pop(job_id, None)
         results = list(self._finished.values())
         self._finished.clear()
-        add_event(
-            "py_kvcache.handler.get_finished_poll",
-            "kv_offload",
-            start_ns,
-            now_ns() - start_ns,
-            args={"active_jobs": active_count, "finished_jobs": len(results)},
-        )
         return results
 
     def wait(self, job_ids: set[int]) -> None:

@@ -285,7 +285,6 @@ def split_block_ids_for_files(
     file_count: int,
     first_block_index: int = 0,
 ) -> list[np.ndarray]:
-    start_ns = now_ns()
     if file_count == 0:
         return []
 
@@ -303,18 +302,6 @@ def split_block_ids_for_files(
 
     if start != len(block_ids):
         raise ValueError("source and destination block counts do not line up")
-    add_event(
-        "py_kvcache.transfer.split_block_ids",
-        "kv_offload",
-        start_ns,
-        now_ns() - start_ns,
-        args={
-            "file_count": file_count,
-            "block_count": int(len(block_ids)),
-            "first_block_index": first_block_index,
-            "blocks_per_file": blocks_per_file,
-        },
-    )
     return chunks
 
 
