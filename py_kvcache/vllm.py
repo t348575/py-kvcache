@@ -141,9 +141,16 @@ class SharedStoragePreloadMessage:
 class SharedStorageOffloadingManager(OffloadingManager):
     """Scheduler-side manager for immutable shared-storage blocks."""
 
-    def __init__(self, file_mapper: FileMapper, *, preload_batch_size: int = 1):
+    def __init__(
+        self,
+        file_mapper: FileMapper,
+        *,
+        preload_batch_size: int = 1,
+        enable_preload: bool = True,
+    ):
         self.file_mapper = file_mapper
         self.preload_batch_size = max(1, preload_batch_size)
+        self.enable_preload = enable_preload
         self._worker_message_sender: Callable[[Any], None] | None = None
 
     def set_worker_message_sender(self, sender: Callable[[Any], None] | None) -> None:
@@ -165,7 +172,8 @@ class SharedStorageOffloadingManager(OffloadingManager):
         preload_batch: list[bytes] = []
 
         def flush_preload_batch() -> None:
-            if not preload_batch:
+            if not preload_batch or not self.enable_preload:
+                preload_batch.clear()
                 return
             send_start_ns = now_ns()
             sent = False
@@ -201,9 +209,10 @@ class SharedStorageOffloadingManager(OffloadingManager):
             if not exists:
                 break
             hit_count += 1
-            preload_batch.append(block_hash)
-            if len(preload_batch) >= self.preload_batch_size:
-                flush_preload_batch()
+            if self.enable_preload:
+                preload_batch.append(block_hash)
+                if len(preload_batch) >= self.preload_batch_size:
+                    flush_preload_batch()
 
         flush_preload_batch()
         add_event(
@@ -291,13 +300,12 @@ class NoopSharedStorageOffloadingHandler(OffloadingHandler):
         self.coordinator = coordinator
         self._active: dict[int, tuple[Future[int], float, tuple[str, str]]] = {}
         self._finished: dict[int, TransferResult] = {}
-        self.preload_messages: list[SharedStoragePreloadMessage] = []
         self.is_shutdown = False
 
     def handle_worker_message(self, message: Any) -> bool:
         start_ns = now_ns()
         if isinstance(message, SharedStoragePreloadMessage):
-            self.preload_messages.append(message)
+            self.coordinator.submit_preload(list(message.block_hashes))
             add_event(
                 "py_kvcache.handler.worker_message",
                 "kv_offload",
@@ -515,12 +523,10 @@ class PyKvCacheOffloadingSpec(OffloadingSpec):
 
     def get_manager(self) -> OffloadingManager:
         if self._manager is None:
-            preload_batch_size = _first_int(
-                self.extra_config.get("preload_batch_size", 1), 1
-            )
             self._manager = SharedStorageOffloadingManager(
                 self.file_mapper,
-                preload_batch_size=preload_batch_size,
+                preload_batch_size=self.shared_file_config.preload_batch_size,
+                enable_preload=self.shared_file_config.enable_preload,
             )
         return self._manager
 

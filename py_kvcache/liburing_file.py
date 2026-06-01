@@ -45,8 +45,14 @@ _IORING_OFF_SQES = 0x10000000
 
 _IORING_OP_READ = 22
 _IORING_OP_WRITE = 23
+_IORING_OP_OPENAT = 18
+_IORING_OP_CLOSE = 19
 _IOSQE_ASYNC = 1 << 4
 _IORING_ENTER_GETEVENTS = 1 << 0
+
+# dirfd sentinel for *at syscalls: resolve the path relative to CWD. With the
+# absolute paths the file mapper produces, the dirfd is ignored entirely.
+_AT_FDCWD = -100
 
 
 def align_up(value: int, alignment: int = DIRECT_IO_ALIGNMENT) -> int:
@@ -188,6 +194,22 @@ class LiburingRing:
     def pending_submit(self) -> int:
         return self._pending_submit
 
+    def _begin_sqe(self) -> tuple[int, int, "_IoUringSqe"]:
+        """Reserve the next free SQE slot. Raises EAGAIN if the SQ is full."""
+        head = int(self._sq_head[0])
+        tail = int(self._sq_tail[0])
+        if tail - head >= self._params.sq_entries:
+            raise BlockingIOError(errno.EAGAIN, "io_uring submission queue is full")
+        index = tail & int(self._sq_mask[0])
+        sqe = self._sqes[index]
+        ctypes.memset(ctypes.byref(sqe), 0, ctypes.sizeof(_IoUringSqe))
+        return index, tail, sqe
+
+    def _commit_sqe(self, index: int, tail: int) -> None:
+        self._sq_array[index] = index
+        self._sq_tail[0] = tail + 1
+        self._pending_submit += 1
+
     def queue_rw(
         self,
         *,
@@ -197,14 +219,7 @@ class LiburingRing:
         nbytes: int,
         write: bool,
     ) -> None:
-        head = int(self._sq_head[0])
-        tail = int(self._sq_tail[0])
-        if tail - head >= self._params.sq_entries:
-            raise BlockingIOError(errno.EAGAIN, "io_uring submission queue is full")
-
-        index = tail & int(self._sq_mask[0])
-        sqe = self._sqes[index]
-        ctypes.memset(ctypes.byref(sqe), 0, ctypes.sizeof(_IoUringSqe))
+        index, tail, sqe = self._begin_sqe()
         sqe.opcode = _IORING_OP_WRITE if write else _IORING_OP_READ
         sqe.flags = _IOSQE_ASYNC
         sqe.fd = fd
@@ -212,9 +227,7 @@ class LiburingRing:
         sqe.addr = int(ptr.value or 0)
         sqe.len = nbytes
         sqe.user_data = user_data
-        self._sq_array[index] = index
-        self._sq_tail[0] = tail + 1
-        self._pending_submit += 1
+        self._commit_sqe(index, tail)
         add_event(
             "py_kvcache.liburing.queue_rw",
             "fs",
@@ -227,6 +240,51 @@ class LiburingRing:
                 "nbytes": nbytes,
             },
         )
+
+    def queue_openat(
+        self,
+        *,
+        user_data: int,
+        path_ptr: int,
+        open_flags: int,
+        mode: int = 0,
+        dirfd: int = _AT_FDCWD,
+    ) -> None:
+        """Queue an async ``openat``. ``path_ptr`` must point at a NUL-terminated
+        path buffer that the caller keeps alive until this op completes.
+
+        The completion ``res`` is the opened fd (>= 0) or ``-errno``.
+        """
+        index, tail, sqe = self._begin_sqe()
+        sqe.opcode = _IORING_OP_OPENAT
+        sqe.flags = _IOSQE_ASYNC
+        sqe.fd = dirfd
+        sqe.off = 0
+        sqe.addr = int(path_ptr)
+        sqe.len = mode
+        # ``rw_flags`` aliases ``open_flags`` in the kernel sqe union.
+        sqe.rw_flags = open_flags
+        sqe.user_data = user_data
+        self._commit_sqe(index, tail)
+        add_event(
+            "py_kvcache.liburing.queue_openat",
+            "fs",
+            now_ns(),
+            0,
+            args={
+                "ring_id": self.ring_id,
+                "pending_submit": self._pending_submit,
+                "open_flags": open_flags,
+            },
+        )
+
+    def queue_close(self, *, user_data: int, fd: int) -> None:
+        """Queue an async ``close``. Completion result is ignored by the reactor."""
+        index, tail, sqe = self._begin_sqe()
+        sqe.opcode = _IORING_OP_CLOSE
+        sqe.fd = fd
+        sqe.user_data = user_data
+        self._commit_sqe(index, tail)
 
     def submit_pending(self) -> None:
         if self._pending_submit == 0:
@@ -358,6 +416,26 @@ class DirectIoFileStore:
             args={"payload_bytes": self.payload_size, "io_bytes": self.io_size},
         )
         return fd
+
+    def queue_open_read(
+        self, ring: LiburingRing, *, user_data: int, path: str
+    ) -> ctypes.Array:
+        """Submit an async ``openat`` for a read fd.
+
+        Returns the path buffer; the caller MUST keep it alive until the open
+        completion is reaped (the kernel reads the path during the async op).
+        """
+        path_buf = ctypes.create_string_buffer(os.fsencode(path) + b"\0")
+        ring.queue_openat(
+            user_data=user_data,
+            path_ptr=ctypes.addressof(path_buf),
+            open_flags=os.O_RDONLY | os.O_DIRECT,
+            mode=0,
+        )
+        return path_buf
+
+    def queue_close(self, ring: LiburingRing, *, user_data: int, fd: int) -> None:
+        ring.queue_close(user_data=user_data, fd=fd)
 
     def open_temp_write(self, final_path: str) -> tuple[int, str]:
         parent = os.path.dirname(final_path)

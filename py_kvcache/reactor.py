@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import collections
 import logging
 import os
 import queue
@@ -70,16 +71,38 @@ class _ReactorJob:
 
 
 @dataclass
+class _PreloadRequest:
+    block_hashes: list[bytes]
+
+
+@dataclass
 class _RingOp:
-    job: _ReactorJob
+    job: _ReactorJob | None  # None for preload reads
     file_index: int
     slot_index: int
     fd: int
     is_write: bool
     start_ns: int
     direct: bool
+    # "open" | "read" | "write" | "close". Opens carry no slot/fd yet; their CQE
+    # res is the opened fd. Closes are fire-and-forget (result ignored).
+    op_kind: str = "read"
     final_path: str | None = None
     temp_path: str | None = None
+    preload_hash: bytes | None = None
+    # Holds the openat path buffer alive until the open CQE is reaped.
+    path_buf: Any = None
+
+
+@dataclass
+class _ReadyFd:
+    """An fd opened by an async ``openat``, waiting for a staging slot + read
+    budget before its read is issued. Slot-free so opens never tie up buffers."""
+    fd: int
+    job: _ReactorJob | None
+    file_index: int
+    preload_hash: bytes | None
+    open_start_ns: int
 
 
 @dataclass
@@ -148,7 +171,14 @@ class IoReactor:
                 self._copy_headroom,
             )
         self.staging_tensors = layout.allocate_staging_tensors(slot_count)
-        self.ring = LiburingRing(max(self.iodepth, 8), ring_id=0)
+        # Pre-open lookahead: how many async ``openat`` ops + opened-but-not-read
+        # fds may be outstanding. Opens are slot-free, so this is independent of
+        # ``iodepth`` (which bounds reads+writes / device queue depth).
+        self.open_lookahead = max(1, config.open_lookahead or self.iodepth)
+        # The ring must hold reads (iodepth) + pre-opens (open_lookahead) + the
+        # trailing async closes simultaneously.
+        ring_depth = max(self.iodepth + self.open_lookahead + 16, 16)
+        self.ring = LiburingRing(ring_depth, ring_id=0)
 
         # Per-slot, pre-allocated CUDA copy scratch (no hot-path allocation).
         self._streams = [torch.cuda.Stream() for _ in range(slot_count)]
@@ -193,6 +223,27 @@ class IoReactor:
         self._closed = False
         self._submit_lock = threading.Lock()
 
+        # Async-open pipeline state (reactor thread only).
+        # Reads + writes in flight on the ring (the ``iodepth`` device budget).
+        self._data_inflight = 0
+        # Async ``openat`` ops in flight on the ring.
+        self._open_inflight = 0
+        # Opened fds awaiting a staging slot + read budget. Loads drained before
+        # preloads so latency-critical reads win the device.
+        self._ready_fds_load: collections.deque[_ReadyFd] = collections.deque()
+        self._ready_fds_preload: collections.deque[_ReadyFd] = collections.deque()
+
+        # Preload state — all accessed from the reactor thread only.
+        # Hashes queued for preload reads but not yet started.
+        self._preload_pending: collections.deque[bytes] = collections.deque()
+        self._preload_pending_set: set[bytes] = set()
+        # In-flight preload reads: hash -> user_data key in _inflight.
+        self._preload_inflight_hashes: dict[bytes, int] = {}
+        # Completed preload reads waiting for a job: hash -> slot_index.
+        self._preload_slots: dict[bytes, int] = {}
+        # Jobs waiting for a preload CQE: hash -> (job, file_index).
+        self._preload_waiters: dict[bytes, tuple[_ReactorJob, int]] = {}
+
         self._worker = threading.Thread(
             target=self._run, name="py-kvcache-reactor", daemon=True
         )
@@ -215,6 +266,13 @@ class IoReactor:
                 return
             self._incoming.put(job)
 
+    def enqueue_preload(self, block_hashes: list[bytes]) -> None:
+        """Called from the coordinator/handler thread to enqueue preload reads."""
+        with self._submit_lock:
+            if self._closed:
+                return
+            self._incoming.put(_PreloadRequest(block_hashes))
+
     def shutdown(self, wait: bool = True) -> None:
         with self._submit_lock:
             if self._closed:
@@ -229,7 +287,15 @@ class IoReactor:
     # -- reactor thread ------------------------------------------------------
 
     def _has_work(self) -> bool:
-        return bool(self._active or self._inflight or self._pending_copies)
+        return bool(
+            self._active
+            or self._inflight
+            or self._pending_copies
+            or self._preload_pending
+            or self._preload_slots
+            or self._ready_fds_load
+            or self._ready_fds_preload
+        )
 
     def _run(self) -> None:
         while not (self._stop and not self._has_work()):
@@ -255,8 +321,38 @@ class IoReactor:
     def _intake(self, item: Any) -> None:
         if item is self._STOP:
             self._stop = True
+            # Release slots held by done preloads with no pending job.
+            for slot_index in self._preload_slots.values():
+                self.staging_pool.release(slot_index)
+            self._preload_slots.clear()
+            self._preload_pending.clear()
+            self._preload_pending_set.clear()
+            # Fail any jobs waiting on preload CQEs.
+            err = RuntimeError("reactor shutting down")
+            for _h, (job, _fi) in list(self._preload_waiters.items()):
+                self._file_terminal(job, ok=False, exc=err)
+            self._preload_waiters.clear()
             return
-        self._active.append(item)
+        if isinstance(item, _PreloadRequest):
+            for h in item.block_hashes:
+                if (
+                    h not in self._preload_pending_set
+                    and h not in self._preload_inflight_hashes
+                    and h not in self._preload_slots
+                ):
+                    self._preload_pending.append(h)
+                    self._preload_pending_set.add(h)
+            return
+        # It's a _ReactorJob.
+        job = item
+        if not job.is_store:
+            # Cut-off: pending (not-yet-started) preload reads for this job's
+            # hashes are superseded — fall back to the normal read path.
+            # Since _PreloadRequests arrive in _incoming before the job (FIFO),
+            # any such hashes are already in _preload_pending_set here.
+            for h in job.block_hashes:
+                self._preload_pending_set.discard(h)
+        self._active.append(job)
 
     def _pump_once(self) -> bool:
         made = False
@@ -328,6 +424,7 @@ class IoReactor:
             self.staging_pool.release(copy.slot_index)
             self._file_terminal(job, ok=False, exc=exc)
             return
+        self._data_inflight += 1
         self._inflight[user_data] = _RingOp(
             job=job,
             file_index=copy.file_index,
@@ -336,6 +433,7 @@ class IoReactor:
             is_write=True,
             start_ns=start_ns,
             direct=direct_view is not None,
+            op_kind="write",
             final_path=final_path,
             temp_path=temp_path,
         )
@@ -350,14 +448,55 @@ class IoReactor:
             op = self._inflight.pop(user_data, None)
             if op is None:
                 continue
-            if op.is_write:
-                self._on_write_complete(op, result)
-            else:
+            kind = op.op_kind
+            if kind == "read":
+                self._data_inflight -= 1
                 self._on_read_complete(op, result)
+            elif kind == "open":
+                self._on_open_complete(op, result)
+            elif kind == "write":
+                self._data_inflight -= 1
+                self._on_write_complete(op, result)
+            # else: close — fire-and-forget, result ignored.
         return True
 
+    def _on_open_complete(self, op: _RingOp, result_fd: int) -> None:
+        self._open_inflight -= 1
+        op.path_buf = None  # kernel no longer reads the path; allow GC
+        if result_fd < 0:
+            exc = OSError(-result_fd, "io_uring openat failed")
+            if op.preload_hash is not None:
+                self._preload_inflight_hashes.pop(op.preload_hash, None)
+                waiter = self._preload_waiters.pop(op.preload_hash, None)
+                if waiter is not None:
+                    job, _fi = waiter
+                    self._file_terminal(job, ok=False, exc=exc)
+                else:
+                    logger.warning(
+                        "py-kvcache preload openat failed (no waiter): %s", exc
+                    )
+            else:
+                assert op.job is not None
+                self._file_terminal(op.job, ok=False, exc=exc)
+            return
+        ready = _ReadyFd(
+            fd=result_fd,
+            job=op.job,
+            file_index=op.file_index,
+            preload_hash=op.preload_hash,
+            open_start_ns=op.start_ns,
+        )
+        if op.preload_hash is not None:
+            self._ready_fds_preload.append(ready)
+        else:
+            self._ready_fds_load.append(ready)
+
     def _on_read_complete(self, op: _RingOp, result_nbytes: int) -> None:
+        if op.preload_hash is not None:
+            self._on_preload_read_complete(op, result_nbytes)
+            return
         job = op.job
+        assert job is not None
         try:
             if result_nbytes < 0:
                 raise OSError(-result_nbytes, "io_uring read failed")
@@ -405,10 +544,71 @@ class IoReactor:
             self.staging_pool.release(op.slot_index)
             self._file_terminal(job, ok=False, exc=exc)
         finally:
-            try:
-                os.close(op.fd)
-            except OSError:
-                pass
+            self._async_close(op.fd)
+
+    def _on_preload_read_complete(self, op: _RingOp, result_nbytes: int) -> None:
+        block_hash = op.preload_hash
+        assert block_hash is not None
+        self._preload_inflight_hashes.pop(block_hash, None)
+        try:
+            if result_nbytes < 0:
+                raise OSError(-result_nbytes, "io_uring preload read failed")
+            if result_nbytes != self.file_store.io_size:
+                raise IOError(
+                    f"io_uring preload read transferred {result_nbytes} bytes, "
+                    f"expected {self.file_store.io_size}"
+                )
+            slot = self.staging_pool.slot(op.slot_index)
+            if not op.direct:
+                self.layout.unpack_storage_slot(
+                    slot.payload, self.staging_tensors, op.slot_index
+                )
+            duration_ns = now_ns() - op.start_ns
+            add_event(
+                "py_kvcache.preload.read_complete",
+                "kv_preload",
+                op.start_ns,
+                duration_ns,
+                args={"nbytes": result_nbytes},
+            )
+            waiter = self._preload_waiters.pop(block_hash, None)
+            if waiter is not None:
+                job, file_index = waiter
+                src_to_dst = self._build_mapping(
+                    op.slot_index,
+                    self._slot_block_ids[op.slot_index],
+                    self.layout.storage_block_size_factor,
+                    job.block_chunks[file_index],
+                    self.layout.gpu_block_size_factor,
+                )
+                copy = self._launch_swap_blocks(
+                    op.slot_index,
+                    self.staging_tensors,
+                    self.layout.gpu_tensors,
+                    src_to_dst,
+                    self.layout.storage_block_bytes,
+                    is_store=False,
+                    job=job,
+                    file_index=file_index,
+                )
+                self._pending_copies.append(copy)
+            elif self._stop:
+                # Shutting down: no job will ever claim this preloaded slot.
+                self.staging_pool.release(op.slot_index)
+            else:
+                self._preload_slots[block_hash] = op.slot_index
+        except BaseException as exc:
+            self.staging_pool.release(op.slot_index)
+            waiter = self._preload_waiters.pop(block_hash, None)
+            if waiter is not None:
+                job, _fi = waiter
+                self._file_terminal(job, ok=False, exc=exc)
+            else:
+                logger.warning(
+                    "py-kvcache preload read failed (no waiter): %s", exc
+                )
+        finally:
+            self._async_close(op.fd)
 
     def _on_write_complete(self, op: _RingOp, result_nbytes: int) -> None:
         job = op.job
@@ -438,54 +638,206 @@ class IoReactor:
 
     # -- scheduling ----------------------------------------------------------
 
-    def _can_schedule(self) -> bool:
-        # ``iodepth`` bounds in-flight ring/device ops (reads + writes) only.
-        # In-flight CUDA copies are GPU-side, not storage I/O, so they must not
-        # consume the device queue budget. Releasing a unit at CQE reap (rather
-        # than at copy completion) lets ``_schedule_work`` refill the ring to
-        # ``iodepth`` in the same pump; copies are bounded by staging slots.
-        return len(self._inflight) < self.iodepth and self.staging_pool.free_count > 0
+    def _can_issue_read(self) -> bool:
+        # ``iodepth`` bounds reads + writes in flight (the device queue depth).
+        # A read also needs a free staging slot for its destination buffer.
+        # In-flight CUDA copies are GPU-side, not storage I/O, so they do not
+        # consume the device budget; the budget unit is released at CQE reap.
+        return self._data_inflight < self.iodepth and self.staging_pool.free_count > 0
+
+    def _can_open(self) -> bool:
+        # Pre-opens are slot-free; bound only the count of in-flight ``openat``
+        # ops plus opened-but-not-yet-read fds, so the reactor reads ahead
+        # without holding unbounded file descriptors.
+        primed = (
+            self._open_inflight
+            + len(self._ready_fds_load)
+            + len(self._ready_fds_preload)
+        )
+        return primed < self.open_lookahead
 
     def _schedule_work(self) -> bool:
         made = False
-        # Loads first (latency-critical), then stores.
-        for want_store in (False, True):
-            for job in self._active:
-                if job.failed is not None or job.is_store != want_store:
-                    continue
-                while (
-                    job.failed is None
-                    and job.next_file_index < job.total_files
-                    and self._can_schedule()
-                ):
-                    if not self._schedule_one(job):
-                        break
+
+        # 0. Drain already-opened fds into reads first — keep the device full.
+        made = self._drain_ready_fds() or made
+
+        # 1. Load jobs (latency-critical). Pre-open upcoming files; preload-done
+        #    and preload-inflight files skip the disk read entirely.
+        for job in self._active:
+            if job.failed is not None or job.is_store:
+                continue
+            while job.failed is None and job.next_file_index < job.total_files:
+                file_index = job.next_file_index
+                h = job.block_hashes[file_index]
+                if h in self._preload_slots:
+                    self._schedule_preload_done(job, file_index)
                     made = True
+                elif h in self._preload_inflight_hashes:
+                    self._schedule_preload_inflight(job, file_index)
+                    made = True
+                else:
+                    if not self._can_open():
+                        break
+                    self._submit_open_read(job, file_index)
+                    made = True
+
+        # 2. Preload opens (lower priority than loads, higher than stores).
+        while self._preload_pending and self._can_open():
+            h = self._preload_pending[0]
+            if h not in self._preload_pending_set:
+                # Hash was cut-off: removed from set but not yet from deque.
+                self._preload_pending.popleft()
+                continue
+            if h in self._preload_inflight_hashes or h in self._preload_slots:
+                self._preload_pending.popleft()
+                self._preload_pending_set.discard(h)
+                continue
+            self._preload_pending.popleft()
+            self._preload_pending_set.discard(h)
+            self._submit_open_preload(h)
+            made = True
+
+        # 3. Store jobs (background): synchronous open + queued write.
+        for job in self._active:
+            if job.failed is not None or not job.is_store:
+                continue
+            while (
+                job.failed is None
+                and job.next_file_index < job.total_files
+                and self._can_issue_read()
+            ):
+                if not self._schedule_one(job):
+                    break
+                made = True
+
+        return made
+
+    def _drain_ready_fds(self) -> bool:
+        """Issue reads for opened fds while read budget + slots allow.
+
+        Loads drain before preloads so the device queue favours latency-critical
+        reads. A read reserves its staging slot only here — opens are slot-free.
+        """
+        made = False
+        for dq in (self._ready_fds_load, self._ready_fds_preload):
+            while dq and self._data_inflight < self.iodepth:
+                slot = self.staging_pool.try_reserve()
+                if slot is None:
+                    return made
+                ready = dq.popleft()
+                self._submit_read_from_ready(ready, slot.index)
+                made = True
         return made
 
     def _schedule_one(self, job: _ReactorJob) -> bool:
+        # Stores only — reads flow through the async-open pipeline.
         slot = self.staging_pool.try_reserve()
         if slot is None:
             return False
-        file_index = job.next_file_index
-        if job.is_store:
-            ok = self._schedule_store_copy(job, file_index, slot.index)
-        else:
-            ok = self._schedule_read(job, file_index, slot.index)
-        if not ok:
-            return True  # a failure was recorded; treat as progress and move on
+        self._schedule_store_copy(job, job.next_file_index, slot.index)
         return True
 
-    def _schedule_read(self, job: _ReactorJob, file_index: int, slot_index: int) -> bool:
+    def _schedule_preload_done(self, job: _ReactorJob, file_index: int) -> None:
+        """File already in staging from a completed preload read — skip disk I/O."""
+        h = job.block_hashes[file_index]
+        slot_index = self._preload_slots.pop(h)
         job.next_file_index += 1
         job.inflight_files += 1
-        final_path = self.file_mapper.get_file_name(job.block_hashes[file_index])
         try:
-            fd = self.file_store.open_read(final_path)
+            src_to_dst = self._build_mapping(
+                slot_index,
+                self._slot_block_ids[slot_index],
+                self.layout.storage_block_size_factor,
+                job.block_chunks[file_index],
+                self.layout.gpu_block_size_factor,
+            )
+            copy = self._launch_swap_blocks(
+                slot_index,
+                self.staging_tensors,
+                self.layout.gpu_tensors,
+                src_to_dst,
+                self.layout.storage_block_bytes,
+                is_store=False,
+                job=job,
+                file_index=file_index,
+            )
+            self._pending_copies.append(copy)
         except BaseException as exc:
             self.staging_pool.release(slot_index)
             self._file_terminal(job, ok=False, exc=exc)
-            return False
+
+    def _schedule_preload_inflight(self, job: _ReactorJob, file_index: int) -> None:
+        """Preload read is in-flight — register a waiter; no slot needed yet."""
+        h = job.block_hashes[file_index]
+        job.next_file_index += 1
+        job.inflight_files += 1
+        self._preload_waiters[h] = (job, file_index)
+
+    def _submit_open_read(self, job: _ReactorJob, file_index: int) -> None:
+        """Submit an async ``openat`` for a load file. The staging slot is
+        reserved later, when the opened fd's read is issued (opens are slot-free
+        so a slow open never ties up a buffer)."""
+        job.next_file_index += 1
+        job.inflight_files += 1
+        final_path = self.file_mapper.get_file_name(job.block_hashes[file_index])
+        user_data = self._new_user_data()
+        start_ns = now_ns()
+        try:
+            path_buf = self.file_store.queue_open_read(
+                self.ring, user_data=user_data, path=final_path
+            )
+        except BaseException as exc:
+            self._file_terminal(job, ok=False, exc=exc)
+            return
+        self._open_inflight += 1
+        self._inflight[user_data] = _RingOp(
+            job=job,
+            file_index=file_index,
+            slot_index=-1,
+            fd=-1,
+            is_write=False,
+            start_ns=start_ns,
+            direct=False,
+            op_kind="open",
+            path_buf=path_buf,
+        )
+
+    def _submit_open_preload(self, block_hash: bytes) -> None:
+        """Submit an async ``openat`` for a preload (no job attached yet)."""
+        final_path = self.file_mapper.get_file_name(block_hash)
+        user_data = self._new_user_data()
+        start_ns = now_ns()
+        add_event(
+            "py_kvcache.preload.open_read",
+            "kv_preload",
+            start_ns,
+            0,
+        )
+        try:
+            path_buf = self.file_store.queue_open_read(
+                self.ring, user_data=user_data, path=final_path
+            )
+        except BaseException as exc:
+            logger.warning("py-kvcache preload openat submit failed: %s", exc)
+            return
+        self._open_inflight += 1
+        self._preload_inflight_hashes[block_hash] = user_data
+        self._inflight[user_data] = _RingOp(
+            job=None,
+            file_index=-1,
+            slot_index=-1,
+            fd=-1,
+            is_write=False,
+            start_ns=start_ns,
+            direct=False,
+            op_kind="open",
+            preload_hash=block_hash,
+            path_buf=path_buf,
+        )
+
+    def _submit_read_from_ready(self, ready: _ReadyFd, slot_index: int) -> None:
+        """Queue the read for an already-opened fd into the reserved slot."""
         direct_view = self._direct_view(slot_index)
         slot = self.staging_pool.slot(slot_index)
         user_data = self._new_user_data()
@@ -494,28 +846,63 @@ class IoReactor:
             self.file_store.queue_read(
                 self.ring,
                 user_data=user_data,
-                fd=fd,
+                fd=ready.fd,
                 slot=slot,
                 io_array=direct_view,
             )
         except BaseException as exc:
+            self._async_close(ready.fd)
+            self.staging_pool.release(slot_index)
+            if ready.preload_hash is not None:
+                self._preload_inflight_hashes.pop(ready.preload_hash, None)
+                waiter = self._preload_waiters.pop(ready.preload_hash, None)
+                if waiter is not None:
+                    self._file_terminal(waiter[0], ok=False, exc=exc)
+                else:
+                    logger.warning(
+                        "py-kvcache preload queue_read failed (no waiter): %s", exc
+                    )
+            else:
+                assert ready.job is not None
+                self._file_terminal(ready.job, ok=False, exc=exc)
+            return
+        self._data_inflight += 1
+        self._inflight[user_data] = _RingOp(
+            job=ready.job,
+            file_index=ready.file_index,
+            slot_index=slot_index,
+            fd=ready.fd,
+            is_write=False,
+            start_ns=start_ns,
+            direct=direct_view is not None,
+            op_kind="read",
+            preload_hash=ready.preload_hash,
+        )
+
+    def _async_close(self, fd: int) -> None:
+        """Close an fd via the ring, off the critical path. Result ignored, but
+        the op is tracked in ``_inflight`` so shutdown drains it cleanly."""
+        if fd < 0:
+            return
+        user_data = self._new_user_data()
+        try:
+            self.file_store.queue_close(self.ring, user_data=user_data, fd=fd)
+        except BaseException:
             try:
                 os.close(fd)
             except OSError:
                 pass
-            self.staging_pool.release(slot_index)
-            self._file_terminal(job, ok=False, exc=exc)
-            return False
+            return
         self._inflight[user_data] = _RingOp(
-            job=job,
-            file_index=file_index,
-            slot_index=slot_index,
+            job=None,
+            file_index=-1,
+            slot_index=-1,
             fd=fd,
             is_write=False,
-            start_ns=start_ns,
-            direct=direct_view is not None,
+            start_ns=now_ns(),
+            direct=False,
+            op_kind="close",
         )
-        return True
 
     def _schedule_store_copy(
         self, job: _ReactorJob, file_index: int, slot_index: int
@@ -817,6 +1204,9 @@ class TransferCoordinator:
         future.set_running_or_notify_cancel()
         self.reactor.submit_job(job)
         return future
+
+    def submit_preload(self, block_hashes: list[bytes]) -> None:
+        self.reactor.enqueue_preload(block_hashes)
 
     def shutdown(self) -> None:
         self.reactor.shutdown()
