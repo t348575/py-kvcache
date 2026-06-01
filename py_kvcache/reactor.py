@@ -343,7 +343,6 @@ class IoReactor:
                     self._preload_pending.append(h)
                     self._preload_pending_set.add(h)
             return
-        # It's a _ReactorJob.
         job = item
         if not job.is_store:
             # Cut-off: pending (not-yet-started) preload reads for this job's
@@ -775,9 +774,8 @@ class IoReactor:
         self._preload_waiters[h] = (job, file_index)
 
     def _submit_open_read(self, job: _ReactorJob, file_index: int) -> None:
-        """Submit an async ``openat`` for a load file. The staging slot is
-        reserved later, when the opened fd's read is issued (opens are slot-free
-        so a slow open never ties up a buffer)."""
+        # Staging slot is reserved later, when the opened fd's read is issued
+        # (opens are slot-free so a slow open never ties up a buffer).
         job.next_file_index += 1
         job.inflight_files += 1
         final_path = self.file_mapper.get_file_name(job.block_hashes[file_index])
@@ -831,7 +829,6 @@ class IoReactor:
         )
 
     def _submit_read_from_ready(self, ready: _ReadyFd, slot_index: int) -> None:
-        """Queue the read for an already-opened fd into the reserved slot."""
         direct_view = self._direct_view(slot_index)
         slot = self.staging_pool.slot(slot_index)
         user_data = self._new_user_data()

@@ -19,16 +19,18 @@ logger = logging.getLogger(__name__)
 try:
     from vllm.config import VllmConfig
     from vllm.v1.kv_cache_interface import KVCacheConfig
-    from vllm.v1.kv_offload.abstract import (
+    from vllm.v1.kv_offload.base import (
+        CanonicalKVCaches,
+        GPULoadStoreSpec,
         LoadStoreSpec,
         OffloadingManager,
+        OffloadingSpec,
         OffloadKey,
         PrepareStoreOutput,
+        ReqContext,
         get_offload_block_hash,
         get_offload_group_idx,
     )
-    from vllm.v1.kv_offload.mediums import GPULoadStoreSpec
-    from vllm.v1.kv_offload.spec import CanonicalKVCaches, OffloadingSpec
     from vllm.v1.kv_offload.worker.worker import (
         OffloadingHandler,
         TransferResult,
@@ -40,6 +42,7 @@ except Exception:
     VllmConfig = Any
     KVCacheConfig = Any
     OffloadKey = Any
+    ReqContext = Any
     CanonicalKVCaches = Any
     TransferSpec = tuple[Any, Any]
 
@@ -165,56 +168,49 @@ class SharedStorageOffloadingManager(OffloadingManager):
             )
         return get_offload_block_hash(key)
 
-    def lookup(self, keys: Iterable[OffloadKey]) -> int:
+    def lookup(self, key: OffloadKey, req_context: ReqContext) -> bool | None:
         start_ns = now_ns()
-        hit_count = 0
-        checked = 0
-        preload_batch: list[bytes] = []
-
-        def flush_preload_batch() -> None:
-            if not preload_batch or not self.enable_preload:
-                preload_batch.clear()
-                return
-            if self._worker_message_sender is not None:
-                self._worker_message_sender(
-                    SharedStoragePreloadMessage(tuple(preload_batch))
-                )
-            preload_batch.clear()
-
-        for key in keys:
-            checked += 1
-            block_hash = self._get_block_hash(key)
-            file_name = self.file_mapper.get_file_name(block_hash)
-            exists = os.path.exists(file_name)
-            if not exists:
-                break
-            hit_count += 1
-            if self.enable_preload:
-                preload_batch.append(block_hash)
-                if len(preload_batch) >= self.preload_batch_size:
-                    flush_preload_batch()
-
-        flush_preload_batch()
+        block_hash = self._get_block_hash(key)
+        file_name = self.file_mapper.get_file_name(block_hash)
+        exists = os.path.exists(file_name)
         add_event(
             "py_kvcache.manager.lookup",
             "kv_offload",
             start_ns,
             now_ns() - start_ns,
-            args={"checked_keys": checked, "hit_count": hit_count},
+            args={"hit": bool(exists)},
         )
-        return hit_count
+        return bool(exists)
 
-    def prepare_load(self, keys: Iterable[OffloadKey]) -> LoadStoreSpec:
+    def _send_preload(self, block_hashes: list[bytes]) -> None:
+        if (
+            not self.enable_preload
+            or self._worker_message_sender is None
+            or not block_hashes
+        ):
+            return
+        for i in range(0, len(block_hashes), self.preload_batch_size):
+            batch = block_hashes[i : i + self.preload_batch_size]
+            self._worker_message_sender(SharedStoragePreloadMessage(tuple(batch)))
+
+    def prepare_load(
+        self, keys: Iterable[OffloadKey], req_context: ReqContext
+    ) -> LoadStoreSpec:
         block_hashes = [self._get_block_hash(key) for key in keys]
+        self._send_preload(block_hashes)
         return SharedStorageLoadStoreSpec(block_hashes)
 
-    def touch(self, keys: Iterable[OffloadKey]) -> None:
+    def touch(self, keys: Iterable[OffloadKey], req_context: ReqContext) -> None:
         return None
 
-    def complete_load(self, keys: Iterable[OffloadKey]) -> None:
+    def complete_load(
+        self, keys: Iterable[OffloadKey], req_context: ReqContext
+    ) -> None:
         return None
 
-    def prepare_store(self, keys: Iterable[OffloadKey]) -> PrepareStoreOutput | None:
+    def prepare_store(
+        self, keys: Iterable[OffloadKey], req_context: ReqContext
+    ) -> PrepareStoreOutput | None:
         start_ns = now_ns()
         keys_to_store: list[OffloadKey] = []
         block_hashes_to_store: list[bytes] = []
@@ -247,8 +243,14 @@ class SharedStorageOffloadingManager(OffloadingManager):
         )
 
     def complete_store(
-        self, keys: Iterable[OffloadKey], success: bool = True
+        self,
+        keys: Iterable[OffloadKey],
+        req_context: ReqContext,
+        success: bool = True,
     ) -> None:
+        return None
+
+    def reset_cache(self) -> None:
         return None
 
 
