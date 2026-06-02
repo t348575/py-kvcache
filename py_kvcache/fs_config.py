@@ -64,7 +64,6 @@ class SharedFileConfig:
     iodepth: int | None = None
     staging_mem: float | None = None
     enable_preload: bool = True
-    preload_batch_size: int = 1
     # Max in-flight async ``openat`` ops + opened-but-not-yet-read fds. Bounds
     # how far ahead the reactor pre-opens read files so the open syscall is
     # overlapped with in-flight reads instead of blocking the issue path.
@@ -100,17 +99,12 @@ class SharedFileConfig:
             extra_config.get("enable_preload"),
             field_name="enable_preload",
         )
-        preload_batch_size = _coerce_int(
-            extra_config.get("preload_batch_size"),
-            field_name="preload_batch_size",
-        )
         open_lookahead = _coerce_int(
             extra_config.get("open_lookahead"),
             field_name="open_lookahead",
         )
 
         _validate_positive(iodepth, field_name="iodepth")
-        _validate_positive(preload_batch_size, field_name="preload_batch_size")
         _validate_positive(open_lookahead, field_name="open_lookahead")
         if staging_mem is not None and staging_mem <= 0:
             raise ValueError("staging_mem must be positive when provided")
@@ -121,7 +115,6 @@ class SharedFileConfig:
             iodepth=iodepth,
             staging_mem=staging_mem,
             enable_preload=True if enable_preload is None else enable_preload,
-            preload_batch_size=1 if preload_batch_size is None else preload_batch_size,
             open_lookahead=open_lookahead,
         )
 

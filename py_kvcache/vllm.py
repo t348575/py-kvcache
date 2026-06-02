@@ -148,11 +148,9 @@ class SharedStorageOffloadingManager(OffloadingManager):
         self,
         file_mapper: FileMapper,
         *,
-        preload_batch_size: int = 1,
         enable_preload: bool = True,
     ):
         self.file_mapper = file_mapper
-        self.preload_batch_size = max(1, preload_batch_size)
         self.enable_preload = enable_preload
         self._worker_message_sender: Callable[[Any], None] | None = None
 
@@ -189,9 +187,7 @@ class SharedStorageOffloadingManager(OffloadingManager):
             or not block_hashes
         ):
             return
-        for i in range(0, len(block_hashes), self.preload_batch_size):
-            batch = block_hashes[i : i + self.preload_batch_size]
-            self._worker_message_sender(SharedStoragePreloadMessage(tuple(batch)))
+        self._worker_message_sender(SharedStoragePreloadMessage(tuple(block_hashes)))
 
     def prepare_load(
         self, keys: Iterable[OffloadKey], req_context: ReqContext
@@ -452,7 +448,6 @@ class PyKvCacheOffloadingSpec(OffloadingSpec):
         if self._manager is None:
             self._manager = SharedStorageOffloadingManager(
                 self.file_mapper,
-                preload_batch_size=self.shared_file_config.preload_batch_size,
                 enable_preload=self.shared_file_config.enable_preload,
             )
         return self._manager
