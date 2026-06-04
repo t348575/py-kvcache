@@ -22,7 +22,7 @@ except Exception:
         return False
 
 
-Sample = tuple[int, int, int]
+Sample = tuple[int, int, int, int]  # start_ns, duration_ns, nbytes, file_index
 
 
 @dataclass(frozen=True)
@@ -301,8 +301,8 @@ def emit_transfer_events(
     file_event = (
         "py_kvcache.file_write" if profile.direction == "gpu_to_storage" else "py_kvcache.file_read"
     )
-    for sample_idx, sample in enumerate(file_samples):
-        start_ns, duration_ns, nbytes = sample[0], sample[1], sample[2]
+    for sample in file_samples:
+        start_ns, duration_ns, nbytes, file_index = sample[0], sample[1], sample[2], sample[3]
         add_event(
             file_event,
             "fs",
@@ -312,7 +312,8 @@ def emit_transfer_events(
             args={
                 "job_id": profile.job_id,
                 "req_id": profile.req_id,
-                "sample": sample_idx,
+                "file_index": file_index,
+                "num_files": num_files,
                 "num_bytes": nbytes,
             },
         )

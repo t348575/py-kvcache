@@ -64,6 +64,9 @@ class SharedFileConfig:
     iodepth: int | None = None
     staging_mem: float | None = None
     enable_preload: bool = True
+    # When on, identical-prefix preload candidates share one disk read + one staging
+    # slot, released by a reference counter once all demanders are served.
+    preload_share_staging: bool = True
     # Max in-flight async openat ops + opened-but-unread fds. Defaults to iodepth.
     open_lookahead: int | None = None
 
@@ -92,6 +95,10 @@ class SharedFileConfig:
             extra_config.get("enable_preload"),
             field_name="enable_preload",
         )
+        preload_share_staging = _coerce_bool(
+            extra_config.get("preload_share_staging"),
+            field_name="preload_share_staging",
+        )
         open_lookahead = _coerce_int(
             extra_config.get("open_lookahead"),
             field_name="open_lookahead",
@@ -108,6 +115,9 @@ class SharedFileConfig:
             iodepth=iodepth,
             staging_mem=staging_mem,
             enable_preload=True if enable_preload is None else enable_preload,
+            preload_share_staging=(
+                True if preload_share_staging is None else preload_share_staging
+            ),
             open_lookahead=open_lookahead,
         )
 

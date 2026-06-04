@@ -88,6 +88,16 @@ class _PreloadInfo:
 
 
 @dataclass
+class _SharedPreloadSlot:
+    # Released only when not cached and no copy still reads from it.
+    block_hash: bytes
+    slot_index: int
+    preload_info: "_PreloadInfo | None"
+    copies_inflight: int = 0
+    cached: bool = True
+
+
+@dataclass
 class _RingOp:
     job: _ReactorJob | None  # None for preload reads
     file_index: int
@@ -123,7 +133,7 @@ class _CopyOp:
     start_event: Any
     end_event: Any
     nbytes: int
-    members: list[tuple[int, "_ReactorJob", int]] | None = None
+    members: list[tuple[int, "_ReactorJob", int, "_SharedPreloadSlot | None"]] | None = None
 
 
 @dataclass
@@ -133,6 +143,9 @@ class _ReadyCopy:
     slot_index: int
     mapping_len: int
     nbytes: int
+    # Per-copy snapshot so shared siblings reusing one slot_index don't clobber it.
+    mapping: Any = None
+    shared: "_SharedPreloadSlot | None" = None
 
 
 class IoReactor:
@@ -219,6 +232,12 @@ class IoReactor:
         self._open_inflight = 0
         self._ready_fds_load: collections.deque[_ReadyFd] = collections.deque()
         self._ready_fds_preload: collections.deque[_ReadyFd] = collections.deque()
+
+        # Shared preload: one read + one slot per hash, released by refcount.
+        self._share_preload = bool(getattr(config, "preload_share_staging", False))
+        # hash -> count of distinct outstanding requests demanding it.
+        self._preload_refcount: dict[bytes, int] = {}
+        self._shared_cached: dict[bytes, _SharedPreloadSlot] = {}
 
         # Multi-copy preload: each requesting req_id gets its own staged copy of a
         # block hash (dedup per (req_id, hash) via _preload_owned).
@@ -401,6 +420,100 @@ class IoReactor:
         )
         return True
 
+    # --- Shared (ref-counted) preload helpers -------------------------------
+
+    def _has_any_shared_state(self, block_hash: bytes) -> bool:
+        return (
+            block_hash in self._shared_cached
+            or self._preload_inflight_hashes.get(block_hash, 0) > 0
+            or self._preload_pending_count.get(block_hash, 0) > 0
+            or block_hash in self._preload_blocked_on_write
+            or block_hash in self._known_missing
+        )
+
+    def _preload_has_copy(self, block_hash: bytes) -> bool:
+        if self._has_inflight_preload(block_hash):
+            return True
+        if self._share_preload:
+            return block_hash in self._shared_cached
+        return self._has_cached_preload(block_hash)
+
+    def _make_preload_info_for_job(self, job: "_ReactorJob", file_index: int) -> "_PreloadInfo":
+        return _PreloadInfo(
+            block_hash=job.block_hashes[file_index],
+            preload_id="",
+            req_id=job.profile.req_id,
+            profile_tid="kv_preload",
+            file_index=file_index,
+            total_files=job.total_files,
+        )
+
+    def _shared_uncache(self, slot: "_SharedPreloadSlot") -> None:
+        if self._shared_cached.get(slot.block_hash) is slot:
+            del self._shared_cached[slot.block_hash]
+            self._preload_cached_total -= 1
+        slot.cached = False
+
+    def _maybe_release_shared(self, slot: "_SharedPreloadSlot") -> None:
+        if slot.cached or slot.copies_inflight > 0:
+            return
+        self.staging_pool.release(slot.slot_index)
+
+    def _purge_owned_for_hash(self, block_hash: bytes) -> None:
+        stale = [k for k in self._preload_owned if k[1] == block_hash]
+        for k in stale:
+            del self._preload_owned[k]
+
+    def _shared_decref(self, req_id: str, block_hash: bytes) -> None:
+        # Only an owner's claim consumes demand; over-counts fall to eviction.
+        key = (req_id, block_hash)
+        if key not in self._preload_owned:
+            return
+        del self._preload_owned[key]
+        count = self._preload_refcount.get(block_hash, 0)
+        if count > 1:
+            self._preload_refcount[block_hash] = count - 1
+            return
+        self._preload_refcount.pop(block_hash, None)
+        slot = self._shared_cached.get(block_hash)
+        if slot is not None:
+            self._shared_uncache(slot)
+            self._maybe_release_shared(slot)
+
+    def _fail_all_preload_waiters(self, block_hash: bytes, exc: BaseException) -> bool:
+        failed = False
+        while True:
+            waiter = self._preload_waiter_pop(block_hash)
+            if waiter is None:
+                break
+            self._file_terminal(waiter[0], ok=False, exc=exc)
+            failed = True
+        return failed
+
+    def _evict_one_shared_slot(self) -> bool:
+        for block_hash, slot in list(self._shared_cached.items()):
+            if slot.copies_inflight > 0:
+                continue  # in use, not actually free
+            had_ref = self._preload_refcount.get(block_hash, 0) > 0
+            self._shared_uncache(slot)
+            self._preload_refcount.pop(block_hash, None)
+            self._purge_owned_for_hash(block_hash)
+            add_event(
+                "py_kvcache.preload.evict_slot",
+                "kv_preload",
+                now_ns(),
+                0,
+                tid=slot.preload_info.profile_tid if slot.preload_info else None,
+                args=self._preload_event_args(
+                    block_hash,
+                    slot.preload_info,
+                    reason="refcount_leak_reclaim" if had_ref else "load_slot_pressure",
+                ),
+            )
+            self.staging_pool.release(slot.slot_index)
+            return True
+        return False
+
     def _has_work(self) -> bool:
         return bool(
             self._active
@@ -409,6 +522,7 @@ class IoReactor:
             or self._copy_ready
             or self._preload_pending
             or self._preload_slots
+            or self._shared_cached
             or self._ready_fds_load
             or self._ready_fds_preload
         )
@@ -450,6 +564,10 @@ class IoReactor:
                 for slot_index, _info in slots:
                     self.staging_pool.release(slot_index)
             self._preload_slots.clear()
+            for slot in self._shared_cached.values():
+                self.staging_pool.release(slot.slot_index)
+            self._shared_cached.clear()
+            self._preload_refcount.clear()
             self._preload_cached_total = 0
             self._preload_inflight_total = 0
             self._preload_pending.clear()
@@ -477,6 +595,12 @@ class IoReactor:
                     file_index=file_index,
                     total_files=total_files,
                 )
+                if self._share_preload:
+                    # Demand counts; a read is queued only for the first demander.
+                    self._preload_refcount[h] = self._preload_refcount.get(h, 0) + 1
+                    if not self._has_any_shared_state(h):
+                        self._pending_push(info)
+                    continue
                 known = self._known_missing.get(h)
                 if known is not None:
                     # Hash already missed; join the deque so store completion re-arms this copy too.
@@ -554,7 +678,7 @@ class IoReactor:
                 assert copy.members is not None
                 per_job: dict[int, list[Any]] = {}
                 order: list[int] = []
-                for _slot_index, job, _file_index in copy.members:
+                for _slot_index, job, _file_index, _shared in copy.members:
                     rec = per_job.get(id(job))
                     if rec is None:
                         per_job[id(job)] = [job, 1]
@@ -571,8 +695,12 @@ class IoReactor:
                             0,
                         )
                     )
-                for slot_index, job, _file_index in copy.members:
-                    self.staging_pool.release(slot_index)
+                for slot_index, job, _file_index, shared in copy.members:
+                    if shared is None:
+                        self.staging_pool.release(slot_index)
+                    else:
+                        shared.copies_inflight -= 1
+                        self._maybe_release_shared(shared)
                     self._file_terminal(job, ok=True)
             made = True
         return made
@@ -645,6 +773,19 @@ class IoReactor:
             if op.preload_hash is not None:
                 h = op.preload_hash
                 self._preload_inflight_remove(h)
+                if self._share_preload:
+                    if self._fail_all_preload_waiters(h, exc):
+                        return
+                    if h in self._store_inflight:
+                        blocked = self._preload_blocked_on_write.get(h)
+                        if blocked is None:
+                            blocked = collections.deque()
+                            self._preload_blocked_on_write[h] = blocked
+                        if preload_info is not None:
+                            blocked.append(preload_info)
+                    elif preload_info is not None:
+                        self._remember_known_missing(preload_info)
+                    return
                 waiter = self._preload_waiter_pop(h)
                 if waiter is not None:
                     job, _fi = waiter
@@ -691,7 +832,7 @@ class IoReactor:
                     f"expected {self.file_store.io_size}"
                 )
             duration_ns = now_ns() - op.start_ns
-            job.file_samples.append((op.start_ns, duration_ns, self.layout.storage_block_bytes))
+            job.file_samples.append((op.start_ns, duration_ns, self.layout.storage_block_bytes, op.file_index))
             self._queue_load_copy(job, op.file_index, op.slot_index)
         except BaseException as exc:
             self.staging_pool.release(op.slot_index)
@@ -700,6 +841,9 @@ class IoReactor:
             self._async_close(op.fd)
 
     def _on_preload_read_complete(self, op: _RingOp, result_nbytes: int) -> None:
+        if self._share_preload:
+            self._on_shared_preload_read_complete(op, result_nbytes)
+            return
         block_hash = op.preload_hash
         assert block_hash is not None
         preload_info = op.preload_info
@@ -774,6 +918,100 @@ class IoReactor:
         finally:
             self._async_close(op.fd)
 
+    def _on_shared_preload_read_complete(self, op: _RingOp, result_nbytes: int) -> None:
+        block_hash = op.preload_hash
+        assert block_hash is not None
+        preload_info = op.preload_info
+        slot_index = op.slot_index
+        self._preload_inflight_remove(block_hash)
+        try:
+            if result_nbytes < 0:
+                raise OSError(-result_nbytes, "io_uring preload read failed")
+            if result_nbytes != self.file_store.io_size:
+                raise IOError(
+                    f"io_uring preload read transferred {result_nbytes} bytes, "
+                    f"expected {self.file_store.io_size}"
+                )
+            duration_ns = now_ns() - op.start_ns
+            has_waiter = self._has_preload_waiter(block_hash)
+            add_event(
+                "py_kvcache.preload.file_read",
+                "kv_preload",
+                op.start_ns,
+                duration_ns,
+                tid=preload_info.profile_tid if preload_info else None,
+                args=self._preload_event_args(
+                    block_hash,
+                    preload_info,
+                    success=True,
+                    nbytes=result_nbytes,
+                    has_waiter=has_waiter,
+                    shared=True,
+                ),
+            )
+            slot = _SharedPreloadSlot(
+                block_hash=block_hash,
+                slot_index=slot_index,
+                preload_info=preload_info,
+                cached=False,
+            )
+            # One read serves every parked waiter for this hash.
+            while True:
+                waiter = self._preload_waiter_pop(block_hash)
+                if waiter is None:
+                    break
+                job, file_index = waiter
+                add_event(
+                    "py_kvcache.preload.place_from_read",
+                    "kv_preload",
+                    now_ns(),
+                    0,
+                    tid=job.profile.profile_tid,
+                    args=self._preload_event_args(
+                        block_hash,
+                        preload_info,
+                        load_job_id=job.job_id,
+                        load_req_id=job.profile.req_id,
+                        load_file_index=file_index,
+                        shared=True,
+                    ),
+                )
+                slot.copies_inflight += 1
+                try:
+                    self._queue_load_copy(job, file_index, slot_index, shared=slot)
+                except BaseException as exc:
+                    slot.copies_inflight -= 1
+                    self._file_terminal(job, ok=False, exc=exc)
+                self._shared_decref(job.profile.req_id, block_hash)
+            if self._stop:
+                self._maybe_release_shared(slot)
+            elif self._preload_refcount.get(block_hash, 0) > 0:
+                slot.cached = True
+                self._shared_cached[block_hash] = slot
+                self._preload_cached_total += 1
+            else:
+                self._maybe_release_shared(slot)
+        except BaseException as exc:
+            add_event(
+                "py_kvcache.preload.file_read",
+                "kv_preload",
+                op.start_ns,
+                now_ns() - op.start_ns,
+                tid=preload_info.profile_tid if preload_info else None,
+                args=self._preload_event_args(
+                    block_hash,
+                    preload_info,
+                    success=False,
+                    error=type(exc).__name__,
+                    shared=True,
+                ),
+            )
+            if not self._fail_all_preload_waiters(block_hash, exc):
+                logger.warning("py-kvcache shared preload read failed (no waiter): %s", exc)
+            self.staging_pool.release(slot_index)
+        finally:
+            self._async_close(op.fd)
+
     def _on_write_complete(self, op: _RingOp, result_nbytes: int) -> None:
         job = op.job
         try:
@@ -790,7 +1028,7 @@ class IoReactor:
                 final_path=op.final_path,
             )
             duration_ns = now_ns() - op.start_ns
-            job.file_samples.append((op.start_ns, duration_ns, self.layout.storage_block_bytes))
+            job.file_samples.append((op.start_ns, duration_ns, self.layout.storage_block_bytes, op.file_index))
             self.staging_pool.release(op.slot_index)
             self._file_terminal(job, ok=True)
             self._release_store_inflight(job.block_hashes[op.file_index], ok=True)
@@ -823,7 +1061,7 @@ class IoReactor:
             idx = job.next_file_index
             if idx < job.total_files:
                 h = job.block_hashes[idx]
-                if not self._has_cached_preload(h) and not self._has_inflight_preload(h):
+                if not self._preload_has_copy(h):
                     return True
         return False
 
@@ -835,6 +1073,8 @@ class IoReactor:
         return occupied < self._max_preload_slots
 
     def _evict_one_preload_slot(self) -> bool:
+        if self._share_preload:
+            return self._evict_one_shared_slot()
         if not self._preload_slots:
             return False
         block_hash = next(iter(self._preload_slots))
@@ -871,6 +1111,27 @@ class IoReactor:
             while job.failed is None and job.next_file_index < job.total_files:
                 file_index = job.next_file_index
                 h = job.block_hashes[file_index]
+                if self._share_preload:
+                    if h in self._shared_cached:
+                        self._shared_claim_from_cache(job, file_index)
+                        made = True
+                    elif self._has_inflight_preload(h):
+                        # One read serves all waiters, so no waiter_room cap here.
+                        self._schedule_preload_inflight(job, file_index)
+                        made = True
+                    elif self._preload_pending_count.get(h, 0) > 0:
+                        # Queued but unopened: promote to a shared read, don't wait on the gate.
+                        if not self._can_open():
+                            break
+                        self._promote_pending_to_shared_read(job, file_index)
+                        made = True
+                    else:
+                        if not self._can_open():
+                            break
+                        self._submit_open_read(job, file_index)
+                        self._shared_decref(job.profile.req_id, h)
+                        made = True
+                    continue
                 if self._has_cached_preload(h):
                     self._schedule_preload_done(job, file_index)
                     made = True
@@ -989,8 +1250,12 @@ class IoReactor:
             return
         if not ok or self._stop:
             return
-        for info in blocked:
-            self._requeue_preload_hash(info)
+        if self._share_preload:
+            # refcount carries multiplicity, so one read-back serves all refholders.
+            self._requeue_preload_hash(blocked[0])
+        else:
+            for info in blocked:
+                self._requeue_preload_hash(info)
         add_event(
             "py_kvcache.preload.wake_after_write",
             "kv_preload",
@@ -1101,6 +1366,43 @@ class IoReactor:
         job.inflight_files += 1
         self._preload_waiter_add(h, job, file_index)
 
+    def _shared_claim_from_cache(self, job: _ReactorJob, file_index: int) -> None:
+        h = job.block_hashes[file_index]
+        slot = self._shared_cached[h]
+        add_event(
+            "py_kvcache.preload.place_from_cache",
+            "kv_preload",
+            now_ns(),
+            0,
+            tid=job.profile.profile_tid,
+            args=self._preload_event_args(
+                h,
+                slot.preload_info,
+                load_job_id=job.job_id,
+                load_req_id=job.profile.req_id,
+                load_file_index=file_index,
+                shared=True,
+                refcount=self._preload_refcount.get(h, 0),
+            ),
+        )
+        job.next_file_index += 1
+        job.inflight_files += 1
+        slot.copies_inflight += 1
+        try:
+            self._queue_load_copy(job, file_index, slot.slot_index, shared=slot)
+        except BaseException as exc:
+            slot.copies_inflight -= 1
+            self._file_terminal(job, ok=False, exc=exc)
+            self._maybe_release_shared(slot)
+        self._shared_decref(job.profile.req_id, h)
+
+    def _promote_pending_to_shared_read(self, job: _ReactorJob, file_index: int) -> None:
+        h = job.block_hashes[file_index]
+        self._cancel_one_pending(h)
+        info = self._make_preload_info_for_job(job, file_index)
+        self._submit_open_preload(info)
+        self._schedule_preload_inflight(job, file_index)
+
     def _submit_open_read(self, job: _ReactorJob, file_index: int) -> None:
         # Slot reserved at read issue, not here — slow opens never tie up buffers.
         job.next_file_index += 1
@@ -1187,11 +1489,19 @@ class IoReactor:
                     ),
                 )
                 self._preload_inflight_remove(ready.preload_hash)
-                waiter = self._preload_waiter_pop(ready.preload_hash)
-                if waiter is not None:
-                    self._file_terminal(waiter[0], ok=False, exc=exc)
+                if self._share_preload:
+                    if not self._fail_all_preload_waiters(ready.preload_hash, exc):
+                        logger.warning(
+                            "py-kvcache shared preload queue_read failed (no waiter): %s", exc
+                        )
                 else:
-                    logger.warning("py-kvcache preload queue_read failed (no waiter): %s", exc)
+                    waiter = self._preload_waiter_pop(ready.preload_hash)
+                    if waiter is not None:
+                        self._file_terminal(waiter[0], ok=False, exc=exc)
+                    else:
+                        logger.warning(
+                            "py-kvcache preload queue_read failed (no waiter): %s", exc
+                        )
             else:
                 assert ready.job is not None
                 self._file_terminal(ready.job, ok=False, exc=exc)
@@ -1279,21 +1589,33 @@ class IoReactor:
         )
         return self._mapping_tensors[slot_index][:mapping_length]
 
-    def _queue_load_copy(self, job: _ReactorJob, file_index: int, slot_index: int) -> None:
-        src_to_dst = self._build_mapping(
-            slot_index,
+    def _queue_load_copy(
+        self,
+        job: _ReactorJob,
+        file_index: int,
+        slot_index: int,
+        *,
+        shared: "_SharedPreloadSlot | None" = None,
+    ) -> None:
+        output = self._mapping_buffers[slot_index]
+        mapping_length = build_block_mapping(
             self._slot_block_ids[slot_index],
             self.layout.storage_block_size_factor,
             job.block_chunks[file_index],
             1,
+            output,
         )
+        # Snapshot: the per-slot buffer is reused, including by shared siblings in a pump.
+        mapping = output[:mapping_length].copy()
         self._copy_ready.append(
             _ReadyCopy(
                 job=job,
                 file_index=file_index,
                 slot_index=slot_index,
-                mapping_len=int(src_to_dst.shape[0]),
+                mapping_len=mapping_length,
                 nbytes=self.layout.storage_block_bytes,
+                mapping=mapping,
+                shared=shared,
             )
         )
 
@@ -1337,7 +1659,11 @@ class IoReactor:
         total = sum(rc.mapping_len for rc in ready)
         if total <= 0:
             for rc in ready:
-                self.staging_pool.release(rc.slot_index)
+                if rc.shared is None:
+                    self.staging_pool.release(rc.slot_index)
+                else:
+                    rc.shared.copies_inflight -= 1
+                    self._maybe_release_shared(rc.shared)
                 self._file_terminal(rc.job, ok=True)
             return True
         self._ensure_fused_capacity(total)
@@ -1352,9 +1678,8 @@ class IoReactor:
                 start_event.record(self._copy_stream)
                 offset = 0
                 for rc in ready:
-                    mapping = self._mapping_buffers[rc.slot_index][: rc.mapping_len]
                     offset = self._fill_swap_ptrs(
-                        mapping,
+                        rc.mapping,
                         staging_tensor,
                         gpu_tensor,
                         block_bytes,
@@ -1371,7 +1696,11 @@ class IoReactor:
                 end_event.record(self._copy_stream)
         except BaseException as exc:
             for rc in ready:
-                self.staging_pool.release(rc.slot_index)
+                if rc.shared is None:
+                    self.staging_pool.release(rc.slot_index)
+                else:
+                    rc.shared.copies_inflight -= 1
+                    self._maybe_release_shared(rc.shared)
                 self._file_terminal(rc.job, ok=False, exc=exc)
             return True
         self._pending_copies.append(
@@ -1384,7 +1713,9 @@ class IoReactor:
                 start_event=start_event,
                 end_event=end_event,
                 nbytes=len(ready) * self.layout.storage_block_bytes,
-                members=[(rc.slot_index, rc.job, rc.file_index) for rc in ready],
+                members=[
+                    (rc.slot_index, rc.job, rc.file_index, rc.shared) for rc in ready
+                ],
             )
         )
         return True
