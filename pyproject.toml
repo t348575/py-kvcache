@@ -11,3 +11,14 @@ requires-python = ">=3.10"
 
 [tool.setuptools.packages.find]
 include = ["py_kvcache*"]
+
+[tool.ruff]
+target-version = "py310"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I"]
+ignore = ["E501"]
+
+[tool.ruff.format]
+quote-style = "double"

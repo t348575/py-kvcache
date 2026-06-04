@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import collections
 import logging
 import os
 import time
-from collections.abc import Callable, Iterable, Iterator, Mapping
-from concurrent.futures import Future, wait as futures_wait
+from collections.abc import Iterable, Iterator, Mapping
+from concurrent.futures import Future
+from concurrent.futures import wait as futures_wait
 from dataclasses import dataclass
 from typing import Any
 
@@ -36,6 +38,7 @@ try:
         TransferResult,
         TransferSpec,
     )
+
     VLLM_AVAILABLE = True
 except Exception:
     VLLM_AVAILABLE = False
@@ -76,12 +79,8 @@ except Exception:
             self.vllm_config = vllm_config
             self.kv_cache_config = kv_cache_config
             self.extra_config = _read_extra_config(vllm_config, kv_cache_config)
-            self.gpu_block_size = [
-                int(self.extra_config.get("gpu_block_size", 1))
-            ]
-            self.block_size_factor = int(
-                self.extra_config.get("block_size_factor", 1)
-            )
+            self.gpu_block_size = [int(self.extra_config.get("gpu_block_size", 1))]
+            self.block_size_factor = int(self.extra_config.get("block_size_factor", 1))
 
     class OffloadingHandler:
         pass
@@ -92,9 +91,7 @@ except Exception:
         success: bool = True
 
 
-def _read_extra_config(
-    vllm_config: Any, kv_cache_config: Any
-) -> Mapping[str, object]:
+def _read_extra_config(vllm_config: Any, kv_cache_config: Any) -> Mapping[str, object]:
     for owner in (kv_cache_config, vllm_config):
         for attr_name in ("kv_connector_extra_config", "extra_config"):
             value = getattr(owner, attr_name, None)
@@ -136,26 +133,18 @@ class SharedStorageLoadStoreSpec(LoadStoreSpec):
         return "SHARED_STORAGE"
 
 
-@dataclass(frozen=True)
-class SharedStoragePreloadMessage:
-    block_hashes: tuple[bytes, ...]
-
-
 class SharedStorageOffloadingManager(OffloadingManager):
-    """Scheduler-side manager for immutable shared-storage blocks."""
-
     def __init__(
         self,
         file_mapper: FileMapper,
-        *,
-        enable_preload: bool = True,
     ):
         self.file_mapper = file_mapper
-        self.enable_preload = enable_preload
-        self._worker_message_sender: Callable[[Any], None] | None = None
-
-    def set_worker_message_sender(self, sender: Callable[[Any], None] | None) -> None:
-        self._worker_message_sender = sender
+        # Positive hits are immutable; misses not cached (another process can publish between steps).
+        self._lookup_cache: dict[bytes, bool] = {}
+        self._last_io_req_id: str | None = None
+        # hash -> count of in-flight stores; lookup() returns None (defer) so the scheduler
+        # waits for the write and loads rather than recomputing a reusable prefix.
+        self._store_inflight: dict[bytes, int] = {}
 
     @staticmethod
     def _get_block_hash(key: OffloadKey) -> bytes:
@@ -166,47 +155,57 @@ class SharedStorageOffloadingManager(OffloadingManager):
             )
         return get_offload_block_hash(key)
 
+    @staticmethod
+    def _req_id(req_context: ReqContext) -> str | None:
+        return getattr(req_context, "req_id", None)
+
+    def _maybe_flush_lookup_cache(self, req_context: ReqContext) -> None:
+        req_id = self._req_id(req_context)
+        if req_id != self._last_io_req_id:
+            self._lookup_cache.clear()
+            self._last_io_req_id = req_id
+
     def lookup(self, key: OffloadKey, req_context: ReqContext) -> bool | None:
         start_ns = now_ns()
         block_hash = self._get_block_hash(key)
-        file_name = self.file_mapper.get_file_name(block_hash)
-        exists = os.path.exists(file_name)
-        add_event(
-            "py_kvcache.manager.lookup",
-            "kv_offload",
-            start_ns,
-            now_ns() - start_ns,
-            args={"hit": bool(exists)},
-        )
-        return bool(exists)
+        from_cache = block_hash in self._lookup_cache
+        if from_cache:
+            cached = True
+        else:
+            cached = os.path.exists(self.file_mapper.get_file_name(block_hash))
+            if cached:
+                self._lookup_cache[block_hash] = True
+        deferred = not cached and block_hash in self._store_inflight
+        # Only emit for real stat or deferral calls; cache hits repeat 100k+ times per file.
+        if not from_cache:
+            add_event(
+                "py_kvcache.manager.lookup",
+                "kv_offload",
+                start_ns,
+                now_ns() - start_ns,
+                args={"hit": bool(cached), "cached": from_cache, "deferred": deferred},
+            )
+        if cached:
+            return True
+        if deferred:
+            return None  # mid-write: defer so scheduler waits for store, then loads
+        return False
 
-    def _send_preload(self, block_hashes: list[bytes]) -> None:
-        if (
-            not self.enable_preload
-            or self._worker_message_sender is None
-            or not block_hashes
-        ):
-            return
-        self._worker_message_sender(SharedStoragePreloadMessage(tuple(block_hashes)))
-
-    def prepare_load(
-        self, keys: Iterable[OffloadKey], req_context: ReqContext
-    ) -> LoadStoreSpec:
+    def prepare_load(self, keys: Iterable[OffloadKey], req_context: ReqContext) -> LoadStoreSpec:
+        self._maybe_flush_lookup_cache(req_context)
         block_hashes = [self._get_block_hash(key) for key in keys]
-        self._send_preload(block_hashes)
         return SharedStorageLoadStoreSpec(block_hashes)
 
     def touch(self, keys: Iterable[OffloadKey], req_context: ReqContext) -> None:
         return None
 
-    def complete_load(
-        self, keys: Iterable[OffloadKey], req_context: ReqContext
-    ) -> None:
+    def complete_load(self, keys: Iterable[OffloadKey], req_context: ReqContext) -> None:
         return None
 
     def prepare_store(
         self, keys: Iterable[OffloadKey], req_context: ReqContext
     ) -> PrepareStoreOutput | None:
+        self._maybe_flush_lookup_cache(req_context)
         start_ns = now_ns()
         keys_to_store: list[OffloadKey] = []
         block_hashes_to_store: list[bytes] = []
@@ -221,6 +220,7 @@ class SharedStorageOffloadingManager(OffloadingManager):
                 continue
             keys_to_store.append(key)
             block_hashes_to_store.append(block_hash)
+            self._store_inflight[block_hash] = self._store_inflight.get(block_hash, 0) + 1
 
         add_event(
             "py_kvcache.manager.prepare_store",
@@ -244,15 +244,24 @@ class SharedStorageOffloadingManager(OffloadingManager):
         req_context: ReqContext,
         success: bool = True,
     ) -> None:
+        for key in keys:
+            block_hash = self._get_block_hash(key)
+            count = self._store_inflight.get(block_hash, 0) - 1
+            if count > 0:
+                self._store_inflight[block_hash] = count
+            else:
+                self._store_inflight.pop(block_hash, None)
+            self._lookup_cache.pop(block_hash, None)
         return None
 
     def reset_cache(self) -> None:
+        self._lookup_cache.clear()
+        self._last_io_req_id = None
+        self._store_inflight.clear()
         return None
 
 
 class NoopSharedStorageOffloadingHandler(OffloadingHandler):
-    """Worker-side handler for py-kvcache load/store transfers."""
-
     def __init__(
         self,
         *,
@@ -261,13 +270,57 @@ class NoopSharedStorageOffloadingHandler(OffloadingHandler):
         self.coordinator = coordinator
         self._active: dict[int, tuple[Future[int], float, tuple[str, str]]] = {}
         self._finished: dict[int, TransferResult] = {}
+        # Bounded FIFO dedup; evicted ids can be re-submitted (reactor deduplicates by hash).
+        self._submitted_preload_ids: "collections.OrderedDict[str, None]" = (
+            collections.OrderedDict()
+        )
+        self._max_submitted_preload_ids = 1024
         self.is_shutdown = False
 
-    def handle_worker_message(self, message: Any) -> bool:
-        if isinstance(message, SharedStoragePreloadMessage):
-            self.coordinator.submit_preload(list(message.block_hashes))
-            return True
-        return False
+    def preload_async(
+        self,
+        preload_id: str,
+        src_spec: LoadStoreSpec,
+        profile_tid: str = "kv_preload",
+        req_id: str = "",
+    ) -> bool:
+        if self.is_shutdown:
+            raise RuntimeError("py-kvcache handler is shut down")
+        if not isinstance(src_spec, SharedStorageLoadStoreSpec):
+            return False
+        if preload_id in self._submitted_preload_ids:
+            self._submitted_preload_ids.move_to_end(preload_id)
+            return False
+        self._submitted_preload_ids[preload_id] = None
+        if len(self._submitted_preload_ids) > self._max_submitted_preload_ids:
+            self._submitted_preload_ids.popitem(last=False)
+        self.coordinator.submit_preload(
+            list(src_spec.block_hashes),
+            preload_id=preload_id,
+            req_id=req_id,
+            profile_tid=profile_tid,
+        )
+        return True
+
+    def load_from_preload_async(
+        self,
+        job_id: int,
+        preload_id: str,
+        src_spec: LoadStoreSpec,
+        dst_spec: LoadStoreSpec,
+        profile_tid: str = "kv_transfer",
+        req_id: str = "",
+    ) -> bool:
+        if not isinstance(src_spec, SharedStorageLoadStoreSpec) or not isinstance(
+            dst_spec, GPULoadStoreSpec
+        ):
+            return False
+        return self.transfer_async(
+            job_id,
+            (src_spec, dst_spec),
+            profile_tid=profile_tid,
+            req_id=req_id,
+        )
 
     def transfer_async(
         self,
@@ -297,8 +350,6 @@ class NoopSharedStorageOffloadingHandler(OffloadingHandler):
                 GPULoadStoreSpec.medium(),
                 SharedStorageLoadStoreSpec.medium(),
             )
-            direction = "gpu_to_storage"
-            num_hashes = len(dst_spec.block_hashes)
         elif isinstance(src_spec, SharedStorageLoadStoreSpec) and isinstance(
             dst_spec, GPULoadStoreSpec
         ):
@@ -313,12 +364,8 @@ class NoopSharedStorageOffloadingHandler(OffloadingHandler):
                 SharedStorageLoadStoreSpec.medium(),
                 GPULoadStoreSpec.medium(),
             )
-            direction = "storage_to_gpu"
-            num_hashes = len(src_spec.block_hashes)
         else:
-            raise TypeError(
-                f"unsupported transfer spec: {type(src_spec)!r} -> {type(dst_spec)!r}"
-            )
+            raise TypeError(f"unsupported transfer spec: {type(src_spec)!r} -> {type(dst_spec)!r}")
 
         self._active[job_id] = (future, started, transfer_type)
         return True
@@ -341,9 +388,7 @@ class NoopSharedStorageOffloadingHandler(OffloadingHandler):
     def wait(self, job_ids: set[int]) -> None:
         start_ns = now_ns()
         futures = [
-            active[0]
-            for job_id in job_ids
-            if (active := self._active.get(job_id)) is not None
+            active[0] for job_id in job_ids if (active := self._active.get(job_id)) is not None
         ]
         if futures:
             futures_wait(futures)
@@ -367,6 +412,7 @@ class NoopSharedStorageOffloadingHandler(OffloadingHandler):
                 )
         self._finished.clear()
         self._active.clear()
+        self._submitted_preload_ids.clear()
         self.coordinator.shutdown()
 
     @staticmethod
@@ -409,19 +455,15 @@ class PyKvCacheOffloadingSpec(OffloadingSpec):
     def __init__(self, vllm_config: VllmConfig, kv_cache_config: KVCacheConfig):
         super().__init__(vllm_config, kv_cache_config)
 
-        self.shared_file_config = SharedFileConfig.from_extra_config(
-            self.extra_config
-        )
+        self.shared_file_config = SharedFileConfig.from_extra_config(self.extra_config)
         self._manager: SharedStorageOffloadingManager | None = None
         self._handler: NoopSharedStorageOffloadingHandler | None = None
 
         parallel_config = getattr(vllm_config, "parallel_config", None)
-        model_name = str(
-            _get_nested_attr(vllm_config, ("model_config", "model"), "unknown-model")
+        model_name = str(_get_nested_attr(vllm_config, ("model_config", "model"), "unknown-model"))
+        dtype = str(_get_nested_attr(vllm_config, ("cache_config", "cache_dtype"), "auto")).replace(
+            "torch.", ""
         )
-        dtype = str(
-            _get_nested_attr(vllm_config, ("cache_config", "cache_dtype"), "auto")
-        ).replace("torch.", "")
         gpu_block_size = _first_int(getattr(self, "gpu_block_size", None), 1)
         block_size_factor = _first_int(getattr(self, "block_size_factor", None), 1)
 
@@ -430,15 +472,9 @@ class PyKvCacheOffloadingSpec(OffloadingSpec):
             model_name=model_name,
             gpu_block_size=gpu_block_size,
             gpu_blocks_per_file=block_size_factor,
-            tp_size=_first_int(
-                getattr(parallel_config, "tensor_parallel_size", None), 1
-            ),
-            pp_size=_first_int(
-                getattr(parallel_config, "pipeline_parallel_size", None), 1
-            ),
-            pcp_size=_first_int(
-                getattr(parallel_config, "prefill_context_parallel_size", None), 1
-            ),
+            tp_size=_first_int(getattr(parallel_config, "tensor_parallel_size", None), 1),
+            pp_size=_first_int(getattr(parallel_config, "pipeline_parallel_size", None), 1),
+            pcp_size=_first_int(getattr(parallel_config, "prefill_context_parallel_size", None), 1),
             rank=_first_int(getattr(parallel_config, "rank", None), 0),
             dtype=dtype,
         )
@@ -446,10 +482,7 @@ class PyKvCacheOffloadingSpec(OffloadingSpec):
 
     def get_manager(self) -> OffloadingManager:
         if self._manager is None:
-            self._manager = SharedStorageOffloadingManager(
-                self.file_mapper,
-                enable_preload=self.shared_file_config.enable_preload,
-            )
+            self._manager = SharedStorageOffloadingManager(self.file_mapper)
         return self._manager
 
     def get_handlers(
@@ -513,6 +546,7 @@ def _make_transfer_result(
         except TypeError:
             return TransferResult(job_id, success)
 
+
 __all__ = [
     "NoopSharedStorageOffloadingHandler",
     "PyKvCacheOffloadingSpec",
@@ -520,6 +554,5 @@ __all__ = [
     "SharedStorageLoadStoreSpec",
     "SharedStorageOffloadingManager",
     "SharedStorageOffloadingSpec",
-    "SharedStoragePreloadMessage",
     "VLLM_AVAILABLE",
 ]

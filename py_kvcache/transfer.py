@@ -88,7 +88,6 @@ def build_block_mapping(
 class ParsedKvLayout:
     gpu_tensors: list[Any]
     bytes_per_kernel_block: list[int]
-    gpu_block_size_factor: int
     storage_block_size_factor: int
     pin_memory: bool
 
@@ -98,11 +97,7 @@ class ParsedKvLayout:
 
     @property
     def gpu_blocks_per_storage_block(self) -> int:
-        if self.storage_block_size_factor % self.gpu_block_size_factor != 0:
-            raise ValueError(
-                "storage block size must be a multiple of the GPU block size"
-            )
-        return self.storage_block_size_factor // self.gpu_block_size_factor
+        return self.storage_block_size_factor
 
     @classmethod
     def from_canonical_kv_caches(
@@ -125,6 +120,12 @@ class ParsedKvLayout:
             raise ValueError("at least one KV cache tensor must be registered")
 
         parsed_gpu_tensors = [kv_cache.tensor for kv_cache in kv_caches.tensors]
+        if len(parsed_gpu_tensors) != 1:
+            raise ValueError(
+                "py-kvcache requires exactly one canonical KV cache tensor "
+                "(direct-staging only); got "
+                f"{len(parsed_gpu_tensors)}"
+            )
         for tensor in parsed_gpu_tensors:
             if tensor.dtype != torch.int8:
                 raise ValueError("canonical KV cache tensors must use int8 dtype")
@@ -135,20 +136,15 @@ class ParsedKvLayout:
             if not tensor.is_cuda:
                 raise ValueError("canonical KV cache tensors must reside on CUDA")
 
-        kernel_block_size = gpu_block_size
-        if gpu_block_size % kernel_block_size != 0:
-            raise ValueError("gpu block size must align to kernel block size")
-        if storage_block_size % kernel_block_size != 0:
-            raise ValueError("storage block size must align to kernel block size")
+        if storage_block_size % gpu_block_size != 0:
+            raise ValueError("storage block size must be a multiple of the gpu block size")
 
         return cls(
             gpu_tensors=parsed_gpu_tensors,
             bytes_per_kernel_block=[
-                int(tensor.element_size()) * int(tensor.stride(0))
-                for tensor in parsed_gpu_tensors
+                int(tensor.element_size()) * int(tensor.stride(0)) for tensor in parsed_gpu_tensors
             ],
-            gpu_block_size_factor=gpu_block_size // kernel_block_size,
-            storage_block_size_factor=storage_block_size // kernel_block_size,
+            storage_block_size_factor=storage_block_size // gpu_block_size,
             pin_memory=is_pin_memory_available(),
         )
 
@@ -177,72 +173,19 @@ class ParsedKvLayout:
             raise ValueError("staging tensor slice must be contiguous")
         return array.reshape(-1)
 
-    def pack_storage_slot_into(
+    def storage_slot_view(
         self,
         staging_tensors: list[Any],
         slot_index: int,
-        payload: np.ndarray,
-    ) -> None:
-        if payload.size < self.storage_block_bytes:
-            raise ValueError(
-                f"payload size {payload.size} is smaller than storage block size {self.storage_block_bytes}"
-            )
-        start = slot_index * self.storage_block_size_factor
-        end = start + self.storage_block_size_factor
-        offset = 0
-        for tensor, kernel_block_bytes in zip(
-            staging_tensors,
-            self.bytes_per_kernel_block,
-        ):
-            nbytes = kernel_block_bytes * self.storage_block_size_factor
-            payload[offset : offset + nbytes] = self._byte_array_view(tensor[start:end])
-            offset += nbytes
-
-    def unpack_storage_slot(
-        self,
-        payload: bytes | bytearray | memoryview | np.ndarray,
-        staging_tensors: list[Any],
-        slot_index: int,
-    ) -> None:
-        payload_view = memoryview(payload).cast("B")
-        if payload_view.nbytes != self.storage_block_bytes:
-            raise ValueError(
-                f"payload size {payload_view.nbytes} does not match storage block size {self.storage_block_bytes}"
-            )
-
-        start = slot_index * self.storage_block_size_factor
-        end = start + self.storage_block_size_factor
-        offset = 0
-        for tensor, kernel_block_bytes in zip(
-            staging_tensors,
-            self.bytes_per_kernel_block,
-        ):
-            expected_nbytes = kernel_block_bytes * self.storage_block_size_factor
-            byte_view = self._byte_array_view(tensor[start:end])
-            byte_view[:] = np.frombuffer(
-                payload_view[offset : offset + expected_nbytes],
-                dtype=np.uint8,
-                count=expected_nbytes,
-            )
-            offset += expected_nbytes
-
-    def direct_storage_slot_view(
-        self,
-        staging_tensors: list[Any],
-        slot_index: int,
-        *,
-        alignment: int,
-    ) -> np.ndarray[Any, np.dtype[np.uint8]] | None:
-        """Return a contiguous CPU staging slot that direct I/O can fill."""
-        if len(staging_tensors) != 1:
-            return None
+    ) -> np.ndarray[Any, np.dtype[np.uint8]]:
         start = slot_index * self.storage_block_size_factor
         end = start + self.storage_block_size_factor
         view = self._byte_array_view(staging_tensors[0][start:end])
         if view.nbytes != self.storage_block_bytes:
-            return None
-        if alignment > 0 and view.ctypes.data % alignment != 0:
-            return None
+            raise ValueError(
+                f"staging slot view size {view.nbytes} does not match storage "
+                f"block size {self.storage_block_bytes}"
+            )
         return view
 
 
@@ -306,11 +249,7 @@ def split_block_ids_for_files(
 
 
 def _merged_duration_ns(samples: list[Sample]) -> int:
-    intervals = sorted(
-        (sample[0], sample[0] + sample[1])
-        for sample in samples
-        if sample[1] > 0
-    )
+    intervals = sorted((sample[0], sample[0] + sample[1]) for sample in samples if sample[1] > 0)
     if not intervals:
         return 0
     merged_start, merged_end = intervals[0]
@@ -338,8 +277,6 @@ def emit_transfer_events(
     transfer_size: int,
     file_samples: list[Sample],
     cuda_samples: list[Sample],
-    pack_samples: list[Sample],
-    unpack_samples: list[Sample],
     num_files: int,
     num_blocks: int,
 ) -> None:
@@ -359,14 +296,10 @@ def emit_transfer_events(
             "num_files": num_files,
             "num_blocks": num_blocks,
             "file_io_bw_GBps": _bandwidth(file_samples),
-            "pack_bw_GBps": _bandwidth(pack_samples),
-            "unpack_bw_GBps": _bandwidth(unpack_samples),
         },
     )
     file_event = (
-        "py_kvcache.file_write"
-        if profile.direction == "gpu_to_storage"
-        else "py_kvcache.file_read"
+        "py_kvcache.file_write" if profile.direction == "gpu_to_storage" else "py_kvcache.file_read"
     )
     for sample_idx, sample in enumerate(file_samples):
         start_ns, duration_ns, nbytes = sample[0], sample[1], sample[2]
@@ -380,7 +313,7 @@ def emit_transfer_events(
                 "job_id": profile.job_id,
                 "req_id": profile.req_id,
                 "sample": sample_idx,
-                "num_bytes": nbytes
+                "num_bytes": nbytes,
             },
         )
     for sample_idx, sample in enumerate(cuda_samples):
@@ -398,34 +331,6 @@ def emit_transfer_events(
                 "direction": profile.direction,
                 "num_bytes": nbytes,
                 "batch_size": max(1, nbytes // layout.storage_block_bytes),
-            },
-        )
-    for sample_idx, sample in enumerate(pack_samples):
-        add_event(
-            "py_kvcache.cpu_pack",
-            "kv_offload",
-            sample[0],
-            sample[1],
-            tid=profile.profile_tid,
-            args={
-                "job_id": profile.job_id,
-                "req_id": profile.req_id,
-                "sample": sample_idx,
-                "num_bytes": sample[2],
-            },
-        )
-    for sample_idx, sample in enumerate(unpack_samples):
-        add_event(
-            "py_kvcache.cpu_unpack",
-            "kv_offload",
-            sample[0],
-            sample[1],
-            tid=profile.profile_tid,
-            args={
-                "job_id": profile.job_id,
-                "req_id": profile.req_id,
-                "sample": sample_idx,
-                "num_bytes": sample[2],
             },
         )
 

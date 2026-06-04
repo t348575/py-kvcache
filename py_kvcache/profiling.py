@@ -1,14 +1,11 @@
 from __future__ import annotations
 
 import time
-from contextlib import contextmanager
-from typing import Any, Iterator
+from typing import Any
 
 try:
-    from simple_profiler import profile_scope as _profile_scope
     from simple_profiler import profiler as _profiler
 except Exception:
-    _profile_scope = None
 
     class _NoopProfiler:
         _active = False
@@ -30,15 +27,6 @@ def now_ns() -> int:
     return time.perf_counter_ns()
 
 
-@contextmanager
-def profile_scope(name: str, category: str, **kwargs: Any) -> Iterator[None]:
-    if _profile_scope is None:
-        yield
-        return
-    with _profile_scope(name, category, **kwargs):
-        yield
-
-
 def add_event(
     name: str,
     category: str,
@@ -58,4 +46,4 @@ def add_event(
     profiler.add_event(name, category, start_ns, duration_ns, **kwargs)
 
 
-__all__ = ["add_event", "is_active", "now_ns", "profile_scope", "profiler"]
+__all__ = ["add_event", "is_active", "now_ns", "profiler"]

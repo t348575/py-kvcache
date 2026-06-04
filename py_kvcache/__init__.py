@@ -7,14 +7,13 @@ from .reactor import IoReactor, TransferCoordinator
 from .staging import StagingPool, StagingSlot
 from .transfer import ParsedKvLayout
 from .vllm import (
+    VLLM_AVAILABLE,
     NoopSharedStorageOffloadingHandler,
     PyKvCacheOffloadingSpec,
     PyKvcacheOffloadingSpec,
     SharedStorageLoadStoreSpec,
     SharedStorageOffloadingManager,
     SharedStorageOffloadingSpec,
-    SharedStoragePreloadMessage,
-    VLLM_AVAILABLE,
 )
 
 __all__ = [
@@ -30,7 +29,6 @@ __all__ = [
     "SharedStorageLoadStoreSpec",
     "SharedStorageOffloadingManager",
     "SharedStorageOffloadingSpec",
-    "SharedStoragePreloadMessage",
     "StagingPool",
     "StagingSlot",
     "TransferCoordinator",

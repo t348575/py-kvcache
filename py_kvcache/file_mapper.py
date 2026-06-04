@@ -31,9 +31,7 @@ class FileMapper:
     def get_file_name(self, block_hash: bytes | int) -> str:
         block_hash_hex = self._to_hex(block_hash)
         subfolder1, subfolder2 = block_hash_hex[:3], block_hash_hex[3:5]
-        return os.path.join(
-            self.base_path, subfolder1, subfolder2, f"{block_hash_hex}.bin"
-        )
+        return os.path.join(self.base_path, subfolder1, subfolder2, f"{block_hash_hex}.bin")
 
     @staticmethod
     def _to_hex(block_hash: bytes | int) -> str:

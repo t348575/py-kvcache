@@ -4,16 +4,12 @@ import ctypes
 import errno
 import os
 import platform
-import time
 import uuid
-from dataclasses import dataclass
 
 import numpy as np
 
 from .fs_config import SharedFileConfig
 from .profiling import add_event, now_ns
-from .staging import StagingSlot
-
 
 DIRECT_IO_ALIGNMENT = 4096
 DEFAULT_IODEPTH = 256
@@ -50,8 +46,7 @@ _IORING_OP_CLOSE = 19
 _IOSQE_ASYNC = 1 << 4
 _IORING_ENTER_GETEVENTS = 1 << 0
 
-# dirfd sentinel for *at syscalls: resolve the path relative to CWD. With the
-# absolute paths the file mapper produces, the dirfd is ignored entirely.
+# dirfd sentinel for *at syscalls; ignored since the file mapper emits absolute paths.
 _AT_FDCWD = -100
 
 
@@ -159,13 +154,11 @@ class LiburingRing:
         self.fd = int(fd)
         self._pending_submit = 0
 
-        self._sq_ring_size = (
-            self._params.sq_off.array
-            + self._params.sq_entries * ctypes.sizeof(ctypes.c_uint32)
+        self._sq_ring_size = self._params.sq_off.array + self._params.sq_entries * ctypes.sizeof(
+            ctypes.c_uint32
         )
-        self._cq_ring_size = (
-            self._params.cq_off.cqes
-            + self._params.cq_entries * ctypes.sizeof(_IoUringCqe)
+        self._cq_ring_size = self._params.cq_off.cqes + self._params.cq_entries * ctypes.sizeof(
+            _IoUringCqe
         )
         self._sqes_size = self._params.sq_entries * ctypes.sizeof(_IoUringSqe)
 
@@ -194,7 +187,6 @@ class LiburingRing:
         return self._pending_submit
 
     def _begin_sqe(self) -> tuple[int, int, "_IoUringSqe"]:
-        """Reserve the next free SQE slot. Raises EAGAIN if the SQ is full."""
         head = int(self._sq_head[0])
         tail = int(self._sq_tail[0])
         if tail - head >= self._params.sq_entries:
@@ -237,11 +229,7 @@ class LiburingRing:
         mode: int = 0,
         dirfd: int = _AT_FDCWD,
     ) -> None:
-        """Queue an async ``openat``. ``path_ptr`` must point at a NUL-terminated
-        path buffer that the caller keeps alive until this op completes.
-
-        The completion ``res`` is the opened fd (>= 0) or ``-errno``.
-        """
+        # path_ptr must remain alive until the open CQE is reaped.
         index, tail, sqe = self._begin_sqe()
         sqe.opcode = _IORING_OP_OPENAT
         sqe.flags = _IOSQE_ASYNC
@@ -249,13 +237,12 @@ class LiburingRing:
         sqe.off = 0
         sqe.addr = int(path_ptr)
         sqe.len = mode
-        # ``rw_flags`` aliases ``open_flags`` in the kernel sqe union.
+        # rw_flags aliases open_flags in the kernel sqe union.
         sqe.rw_flags = open_flags
         sqe.user_data = user_data
         self._commit_sqe(index, tail)
 
     def queue_close(self, *, user_data: int, fd: int) -> None:
-        """Queue an async ``close``. Completion result is ignored by the reactor."""
         index, tail, sqe = self._begin_sqe()
         sqe.opcode = _IORING_OP_CLOSE
         sqe.fd = fd
@@ -284,12 +271,6 @@ class LiburingRing:
         self._pending_submit = max(0, self._pending_submit - int(submitted))
 
     def poll_all(self) -> list[tuple[int, int]]:
-        """Drain every ready completion in one pass.
-
-        The single-issuer reactor matches each ``user_data`` to its in-flight
-        op, so completion order does not matter and no out-of-order cache is
-        needed. Returns ``(user_data, res)`` pairs.
-        """
         head = int(self._cq_head[0])
         tail = int(self._cq_tail[0])
         if head == tail:
@@ -329,9 +310,7 @@ class LiburingRing:
 
     @staticmethod
     def _u32_ptr(base: ctypes.c_void_p, offset: int):
-        return ctypes.cast(
-            ctypes.c_void_p(base.value + offset), ctypes.POINTER(ctypes.c_uint32)
-        )
+        return ctypes.cast(ctypes.c_void_p(base.value + offset), ctypes.POINTER(ctypes.c_uint32))
 
     @staticmethod
     def _u32_array(base: ctypes.c_void_p, offset: int, count: int):
@@ -349,26 +328,8 @@ class DirectIoFileStore:
         if not hasattr(os, "O_DIRECT"):
             raise RuntimeError("direct I/O requires os.O_DIRECT support")
 
-    def open_read(self, path: str) -> int:
-        start_ns = now_ns()
-        fd = os.open(path, os.O_RDONLY | os.O_DIRECT)
-        add_event(
-            "py_kvcache.file.open_read",
-            "fs",
-            start_ns,
-            now_ns() - start_ns,
-            args={"payload_bytes": self.payload_size, "io_bytes": self.io_size},
-        )
-        return fd
-
-    def queue_open_read(
-        self, ring: LiburingRing, *, user_data: int, path: str
-    ) -> ctypes.Array:
-        """Submit an async ``openat`` for a read fd.
-
-        Returns the path buffer; the caller MUST keep it alive until the open
-        completion is reaped (the kernel reads the path during the async op).
-        """
+    def queue_open_read(self, ring: LiburingRing, *, user_data: int, path: str) -> ctypes.Array:
+        # Caller must keep the returned buffer alive until the open CQE is reaped.
         path_buf = ctypes.create_string_buffer(os.fsencode(path) + b"\0")
         ring.queue_openat(
             user_data=user_data,
@@ -395,15 +356,13 @@ class DirectIoFileStore:
         *,
         user_data: int,
         fd: int,
-        slot: StagingSlot,
-        io_array: np.ndarray | None = None,
+        io_array: np.ndarray,
     ) -> None:
-        array = io_array if io_array is not None else slot.array
-        self._validate_io_array(array)
+        self._validate_io_array(io_array)
         ring.queue_rw(
             user_data=user_data,
             fd=fd,
-            ptr=ctypes.c_void_p(array.ctypes.data),
+            ptr=ctypes.c_void_p(io_array.ctypes.data),
             nbytes=self.io_size,
             write=False,
         )
@@ -414,17 +373,13 @@ class DirectIoFileStore:
         *,
         user_data: int,
         fd: int,
-        slot: StagingSlot,
-        io_array: np.ndarray | None = None,
+        io_array: np.ndarray,
     ) -> None:
-        array = io_array if io_array is not None else slot.array
-        self._validate_io_array(array)
-        if io_array is None:
-            slot.clear_padding()
+        self._validate_io_array(io_array)
         ring.queue_rw(
             user_data=user_data,
             fd=fd,
-            ptr=ctypes.c_void_p(array.ctypes.data),
+            ptr=ctypes.c_void_p(io_array.ctypes.data),
             nbytes=self.io_size,
             write=True,
         )
@@ -507,6 +462,5 @@ __all__ = [
     "DIRECT_IO_ALIGNMENT",
     "DirectIoFileStore",
     "LiburingRing",
-    "TimedIoResult",
     "align_up",
 ]

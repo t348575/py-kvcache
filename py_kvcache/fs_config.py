@@ -64,24 +64,17 @@ class SharedFileConfig:
     iodepth: int | None = None
     staging_mem: float | None = None
     enable_preload: bool = True
-    # Max in-flight async ``openat`` ops + opened-but-not-yet-read fds. Bounds
-    # how far ahead the reactor pre-opens read files so the open syscall is
-    # overlapped with in-flight reads instead of blocking the issue path.
-    # Defaults to ``iodepth`` when unset.
+    # Max in-flight async openat ops + opened-but-unread fds. Defaults to iodepth.
     open_lookahead: int | None = None
 
     @classmethod
-    def from_extra_config(
-        cls, extra_config: Mapping[str, object]
-    ) -> "SharedFileConfig":
+    def from_extra_config(cls, extra_config: Mapping[str, object]) -> "SharedFileConfig":
         root_dir = _coerce_str(
             extra_config.get("shared_storage_path"),
             field_name="shared_storage_path",
         )
         if not root_dir:
-            raise ValueError(
-                "shared_storage_path must be provided in kv_connector_extra_config"
-            )
+            raise ValueError("shared_storage_path must be provided in kv_connector_extra_config")
 
         sync_on_store = _coerce_bool(
             extra_config.get("sync_on_store"),
