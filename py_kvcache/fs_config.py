@@ -63,12 +63,18 @@ class SharedFileConfig:
     sync_on_store: bool = False
     iodepth: int | None = None
     staging_mem: float | None = None
-    enable_preload: bool = True
+    enable_preload: bool = False
     # When on, identical-prefix preload candidates share one disk read + one staging
     # slot, released by a reference counter once all demanders are served.
     preload_share_staging: bool = True
     # Max in-flight async openat ops + opened-but-unread fds. Defaults to iodepth.
     open_lookahead: int | None = None
+    # Optional staging-data cache (read-side reuse of completed staging buffers):
+    # "off" (default), "lru", or "arc". Store buffers are never cached.
+    staging_cache: str = "off"
+    # Optional path to a per-(GPU, model, SSD, dtype) break-even data file. Absent
+    # => no load-side break-even gating (loads/stores behave exactly as before).
+    prefix_cache_break_even_path: str | None = None
 
     @classmethod
     def from_extra_config(cls, extra_config: Mapping[str, object]) -> "SharedFileConfig":
@@ -103,6 +109,18 @@ class SharedFileConfig:
             extra_config.get("open_lookahead"),
             field_name="open_lookahead",
         )
+        staging_cache = _coerce_str(
+            extra_config.get("staging_cache"),
+            field_name="staging_cache",
+        )
+        staging_cache = "off" if staging_cache is None else staging_cache.strip().lower()
+        if staging_cache not in {"off", "lru", "arc"}:
+            raise ValueError("staging_cache must be one of: off, lru, arc")
+
+        prefix_cache_break_even_path = _coerce_str(
+            extra_config.get("prefix_cache_break_even_path"),
+            field_name="prefix_cache_break_even_path",
+        )
 
         _validate_positive(iodepth, field_name="iodepth")
         _validate_positive(open_lookahead, field_name="open_lookahead")
@@ -114,11 +132,13 @@ class SharedFileConfig:
             sync_on_store=False if sync_on_store is None else sync_on_store,
             iodepth=iodepth,
             staging_mem=staging_mem,
-            enable_preload=True if enable_preload is None else enable_preload,
+            enable_preload=False if enable_preload is None else enable_preload,
             preload_share_staging=(
                 True if preload_share_staging is None else preload_share_staging
             ),
             open_lookahead=open_lookahead,
+            staging_cache=staging_cache,
+            prefix_cache_break_even_path=prefix_cache_break_even_path,
         )
 
 

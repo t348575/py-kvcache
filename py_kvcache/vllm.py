@@ -10,10 +10,11 @@ from concurrent.futures import wait as futures_wait
 from dataclasses import dataclass
 from typing import Any
 
+from .break_even import load_break_even
 from .file_mapper import FileMapper
 from .fs_config import SharedFileConfig
 from .profiling import add_event, now_ns
-from .reactor import TransferCoordinator
+from .reactor import LoadDeclined, TransferCoordinator
 from .transfer import ParsedKvLayout
 
 logger = logging.getLogger(__name__)
@@ -270,6 +271,9 @@ class NoopSharedStorageOffloadingHandler(OffloadingHandler):
         self.coordinator = coordinator
         self._active: dict[int, tuple[Future[int], float, tuple[str, str]]] = {}
         self._finished: dict[int, TransferResult] = {}
+        # GPU block ids of loads declined by the break-even gate; drained by the
+        # connector worker into vLLM invalid_block_ids so the scheduler recomputes.
+        self._declined_block_ids: set[int] = set()
         # Bounded FIFO dedup; evicted ids can be re-submitted (reactor deduplicates by hash).
         self._submitted_preload_ids: "collections.OrderedDict[str, None]" = (
             collections.OrderedDict()
@@ -385,6 +389,14 @@ class NoopSharedStorageOffloadingHandler(OffloadingHandler):
         self._finished.clear()
         return results
 
+    def get_declined_block_ids(self) -> set[int]:
+        """Drain GPU block ids of break-even-declined loads (recompute targets)."""
+        if not self._declined_block_ids:
+            return set()
+        declined = self._declined_block_ids
+        self._declined_block_ids = set()
+        return declined
+
     def wait(self, job_ids: set[int]) -> None:
         start_ns = now_ns()
         futures = [
@@ -415,8 +427,8 @@ class NoopSharedStorageOffloadingHandler(OffloadingHandler):
         self._submitted_preload_ids.clear()
         self.coordinator.shutdown()
 
-    @staticmethod
     def _future_to_transfer_result(
+        self,
         job_id: int,
         future: Future[int],
         started: float,
@@ -428,6 +440,17 @@ class NoopSharedStorageOffloadingHandler(OffloadingHandler):
                 job_id=job_id,
                 success=True,
                 transfer_size=transfer_size,
+                transfer_time=time.perf_counter() - started,
+                transfer_type=transfer_type,
+            )
+        except LoadDeclined as declined:
+            # Not a failure: the load was gated out. Report the job complete so
+            # the request resumes, and surface its blocks for recompute.
+            self._declined_block_ids.update(declined.block_ids)
+            return _make_transfer_result(
+                job_id=job_id,
+                success=True,
+                transfer_size=0,
                 transfer_time=time.perf_counter() - started,
                 transfer_type=transfer_type,
             )
@@ -480,6 +503,16 @@ class PyKvCacheOffloadingSpec(OffloadingSpec):
         )
         os.makedirs(self.file_mapper.base_path, exist_ok=True)
 
+        # Medium-aware break-even thresholds for the worker load gate. Disabled
+        # (no gating) when no file is configured. Read by the connector worker
+        # from the coordinator; not used scheduler-side (stores always happen).
+        self.break_even = load_break_even(
+            self.shared_file_config.prefix_cache_break_even_path,
+            model_name=model_name,
+            kv_dtype=dtype,
+        )
+        self.storage_block_tokens = gpu_block_size * block_size_factor
+
     def get_manager(self) -> OffloadingManager:
         if self._manager is None:
             self._manager = SharedStorageOffloadingManager(self.file_mapper)
@@ -504,6 +537,8 @@ class PyKvCacheOffloadingSpec(OffloadingSpec):
                 config=self.shared_file_config,
                 file_mapper=self.file_mapper,
                 layout=layout,
+                break_even=self.break_even,
+                storage_block_tokens=storage_block_size,
             )
             self._handler = NoopSharedStorageOffloadingHandler(
                 coordinator=coordinator,

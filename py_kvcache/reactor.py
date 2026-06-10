@@ -12,6 +12,7 @@ from typing import Any
 
 import numpy as np
 
+from .break_even import BreakEvenThresholds, should_load
 from .file_mapper import FileMapper
 from .fs_config import SharedFileConfig
 from .liburing_file import (
@@ -22,6 +23,7 @@ from .liburing_file import (
 )
 from .profiling import add_event, now_ns
 from .staging import StagingPool
+from .staging_cache import StagingDataCache, _CacheSlot
 from .transfer import (
     ParsedKvLayout,
     _TransferProfile,
@@ -46,6 +48,18 @@ except Exception:
 logger = logging.getLogger(__name__)
 
 
+class LoadDeclined(Exception):
+    """A load gated out by break-even: its GPU blocks must be recomputed.
+
+    Carries the destination GPU block ids so the handler can surface them as
+    vLLM `invalid_block_ids`. Not an error — the load was deliberately skipped.
+    """
+
+    def __init__(self, block_ids: list[int]) -> None:
+        super().__init__("load declined by prefix-cache break-even gate")
+        self.block_ids = block_ids
+
+
 @dataclass
 class _ReactorJob:
     job_id: int
@@ -65,6 +79,9 @@ class _ReactorJob:
     future_set: bool = False
     file_samples: list = field(default_factory=list)
     cuda_samples: list = field(default_factory=list)
+    n_from_file: int = 0
+    n_from_preload: int = 0
+    n_from_cache: int = 0
     # Store-only: compute-stream event the store copy waits on before reading GPU KV.
     compute_event: Any = None
 
@@ -146,6 +163,7 @@ class _ReadyCopy:
     # Per-copy snapshot so shared siblings reusing one slot_index don't clobber it.
     mapping: Any = None
     shared: "_SharedPreloadSlot | None" = None
+    cache: "_CacheSlot | None" = None
 
 
 class IoReactor:
@@ -157,12 +175,18 @@ class IoReactor:
         config: SharedFileConfig,
         file_mapper: FileMapper,
         layout: ParsedKvLayout,
+        break_even: BreakEvenThresholds | None = None,
+        storage_block_tokens: int = 0,
     ) -> None:
         if not TORCH_COPY_AVAILABLE:
             raise RuntimeError("vLLM and torch are required for the I/O reactor")
         self.config = config
         self.file_mapper = file_mapper
         self.layout = layout
+        # Load-side break-even gate: decline sub-threshold loads to GPU recompute.
+        # Disabled (no gating) when thresholds are off or block-token size unknown.
+        self._break_even = break_even or BreakEvenThresholds()
+        self._storage_block_tokens = storage_block_tokens
         payload_size = layout.storage_block_bytes
         io_size = align_up(payload_size)
         self.file_store = DirectIoFileStore(config, payload_size=payload_size)
@@ -269,6 +293,14 @@ class IoReactor:
             collections.OrderedDict()
         )
         self._max_known_missing = 4096
+
+        cache_kind = str(getattr(config, "staging_cache", "off") or "off").lower()
+        self._max_cache_slots = max(0, self.staging_pool.slot_count - self.iodepth)
+        self._staging_cache: StagingDataCache | None = (
+            StagingDataCache(policy=cache_kind, capacity=self._max_cache_slots)
+            if cache_kind != "off" and self._max_cache_slots > 0
+            else None
+        )
 
         self._worker = threading.Thread(target=self._run, name="py-kvcache-reactor", daemon=True)
         self._worker.start()
@@ -432,6 +464,8 @@ class IoReactor:
         )
 
     def _preload_has_copy(self, block_hash: bytes) -> bool:
+        if self._staging_cache is not None and block_hash in self._staging_cache:
+            return True
         if self._has_inflight_preload(block_hash):
             return True
         if self._share_preload:
@@ -457,7 +491,7 @@ class IoReactor:
     def _maybe_release_shared(self, slot: "_SharedPreloadSlot") -> None:
         if slot.cached or slot.copies_inflight > 0:
             return
-        self.staging_pool.release(slot.slot_index)
+        self._release_or_cache(slot.block_hash, slot.slot_index)
 
     def _purge_owned_for_hash(self, block_hash: bytes) -> None:
         stale = [k for k in self._preload_owned if k[1] == block_hash]
@@ -567,6 +601,18 @@ class IoReactor:
             for slot in self._shared_cached.values():
                 self.staging_pool.release(slot.slot_index)
             self._shared_cached.clear()
+            if self._staging_cache is not None:
+                retained = len(self._staging_cache)
+                for slot_index in self._staging_cache.drain():
+                    self.staging_pool.release(slot_index)
+                if retained:
+                    add_event(
+                        "py_kvcache.staging_cache.retained_at_shutdown",
+                        "kv_staging_cache",
+                        now_ns(),
+                        0,
+                        args={"count": retained},
+                    )
             self._preload_refcount.clear()
             self._preload_cached_total = 0
             self._preload_inflight_total = 0
@@ -585,6 +631,8 @@ class IoReactor:
         if isinstance(item, _PreloadRequest):
             total_files = len(item.block_hashes)
             for file_index, h in enumerate(item.block_hashes):
+                if self._staging_cache is not None and h in self._staging_cache:
+                    continue  # already resident; the real load will hit the cache
                 if not self._preload_own(item.req_id, h):
                     continue
                 info = _PreloadInfo(
@@ -611,27 +659,75 @@ class IoReactor:
             return
         job = item
         if not job.is_store:
+            if self._break_even.enabled and self._should_decline_load(job):
+                self._decline_load(job)
+                return
             # Clear stale known-missing marks; in-flight/cached copies stay for their owners.
             for h in job.block_hashes:
                 self._known_missing.pop(h, None)
         else:
+            producer = job.profile.req_id
             for h in job.block_hashes:
+                # A request never loads a prefix it produced, so withdraw its own
+                # speculative demand; else a FRESH unique-prefix store would re-arm
+                # a pointless read-back of its just-written bytes.
+                if self._share_preload:
+                    self._shared_decref(producer, h)
                 missed = self._known_missing.pop(h, None)
                 if missed:
-                    blocked = self._preload_blocked_on_write.get(h)
-                    if blocked is None:
-                        self._preload_blocked_on_write[h] = missed
+                    if self._share_preload:
+                        rearm = missed if self._preload_refcount.get(h, 0) > 0 else None
                     else:
-                        blocked.extend(missed)
+                        rearm = collections.deque(
+                            info for info in missed if info.req_id != producer
+                        )
+                        rearm = rearm or None
+                    if rearm:
+                        blocked = self._preload_blocked_on_write.get(h)
+                        if blocked is None:
+                            self._preload_blocked_on_write[h] = rearm
+                        else:
+                            blocked.extend(rearm)
                 self._store_inflight[h] = self._store_inflight.get(h, 0) + 1
         self._active.append(job)
+
+    def _should_decline_load(self, job: "_ReactorJob") -> bool:
+        # Medium is RAM only if every block is already cheaply available (cached
+        # or an in-flight/cached preload copy) -> no fresh disk read on this load.
+        # Otherwise a fresh SSD read is required -> SSD threshold applies.
+        prefix_tokens = job.total_files * self._storage_block_tokens
+        if prefix_tokens <= 0:
+            return False
+        ram_resident = all(self._preload_has_copy(h) for h in job.block_hashes)
+        return not should_load(prefix_tokens, self._break_even, ram_resident=ram_resident)
+
+    def _decline_load(self, job: "_ReactorJob") -> None:
+        block_ids = [
+            int(b)
+            for chunk in job.block_chunks
+            for b in np.asarray(chunk).reshape(-1)
+        ]
+        add_event(
+            "py_kvcache.break_even.decline_load",
+            "kv_offload",
+            now_ns(),
+            0,
+            tid=job.profile.profile_tid,
+            args={
+                "req_id": job.profile.req_id,
+                "job_id": job.job_id,
+                "prefix_tokens": job.total_files * self._storage_block_tokens,
+                "num_blocks": len(block_ids),
+            },
+        )
+        job.future_set = True
+        job.future.set_exception(LoadDeclined(block_ids))
 
     def _pump_once(self) -> bool:
         made = False
         made = self._drain_cuda_copies() or made
         made = self._poll_ring_completions() or made
         made = self._schedule_work() or made
-        # Fuse all load copies queued this pump into one swap_blocks_batch.
         # Fuse all load copies queued this pump into one swap_blocks_batch.
         made = self._flush_copy_batch() or made
         self.ring.submit_pending()
@@ -678,7 +774,7 @@ class IoReactor:
                 assert copy.members is not None
                 per_job: dict[int, list[Any]] = {}
                 order: list[int] = []
-                for _slot_index, job, _file_index, _shared in copy.members:
+                for _slot_index, job, _file_index, _shared, _cache in copy.members:
                     rec = per_job.get(id(job))
                     if rec is None:
                         per_job[id(job)] = [job, 1]
@@ -695,12 +791,8 @@ class IoReactor:
                             0,
                         )
                     )
-                for slot_index, job, _file_index, shared in copy.members:
-                    if shared is None:
-                        self.staging_pool.release(slot_index)
-                    else:
-                        shared.copies_inflight -= 1
-                        self._maybe_release_shared(shared)
+                for slot_index, job, file_index, shared, cache in copy.members:
+                    self._settle_load_slot(job, file_index, slot_index, shared, cache)
                     self._file_terminal(job, ok=True)
             made = True
         return made
@@ -712,6 +804,7 @@ class IoReactor:
         try:
             fd, temp_path = self.file_store.open_temp_write(final_path)
         except BaseException as exc:
+            self._data_inflight -= 1
             self.staging_pool.release(copy.slot_index)
             self._file_terminal(job, ok=False, exc=exc)
             self._release_store_inflight(job.block_hashes[copy.file_index], ok=False)
@@ -726,12 +819,12 @@ class IoReactor:
                 io_array=io_view,
             )
         except BaseException as exc:
+            self._data_inflight -= 1
             self.file_store.cleanup_temp(fd=fd, temp_path=temp_path)
             self.staging_pool.release(copy.slot_index)
             self._file_terminal(job, ok=False, exc=exc)
             self._release_store_inflight(job.block_hashes[copy.file_index], ok=False)
             return
-        self._data_inflight += 1
         self._inflight[user_data] = _RingOp(
             job=job,
             file_index=copy.file_index,
@@ -889,7 +982,7 @@ class IoReactor:
                         load_file_index=file_index,
                     ),
                 )
-                self._queue_load_copy(job, file_index, op.slot_index)
+                self._queue_load_copy(job, file_index, op.slot_index, source="preload")
             elif self._stop:
                 self.staging_pool.release(op.slot_index)
             else:
@@ -978,7 +1071,7 @@ class IoReactor:
                 )
                 slot.copies_inflight += 1
                 try:
-                    self._queue_load_copy(job, file_index, slot_index, shared=slot)
+                    self._queue_load_copy(job, file_index, slot_index, shared=slot, source="preload")
                 except BaseException as exc:
                     slot.copies_inflight -= 1
                     self._file_terminal(job, ok=False, exc=exc)
@@ -1029,7 +1122,9 @@ class IoReactor:
             )
             duration_ns = now_ns() - op.start_ns
             job.file_samples.append((op.start_ns, duration_ns, self.layout.storage_block_bytes, op.file_index))
-            self.staging_pool.release(op.slot_index)
+            # The store slot view is byte-identical to a read of the same hash, so
+            # retain it as a cache entry instead of releasing (write-back).
+            self._release_or_cache(job.block_hashes[op.file_index], op.slot_index)
             self._file_terminal(job, ok=True)
             self._release_store_inflight(job.block_hashes[op.file_index], ok=True)
         except BaseException as exc:
@@ -1038,9 +1133,10 @@ class IoReactor:
             self._file_terminal(job, ok=False, exc=exc)
             self._release_store_inflight(job.block_hashes[op.file_index], ok=False)
 
-    def _can_issue_read(self) -> bool:
+    def _can_issue_store(self) -> bool:
         # Device budget released at CQE reap, not at CUDA copy completion.
-        return self._data_inflight < self.iodepth and self.staging_pool.free_count > 0
+        # Slot acquisition is _schedule_one's job (evicts a preload slot if full).
+        return self._data_inflight < self.iodepth
 
     def _can_open(self) -> bool:
         primed = self._open_inflight + len(self._ready_fds_load) + len(self._ready_fds_preload)
@@ -1092,11 +1188,92 @@ class IoReactor:
         self.staging_pool.release(slot_index)
         return True
 
-    def _reserve_load_slot(self):
+    def _evict_one_cache_slot(self, reason: str) -> bool:
+        if self._staging_cache is None:
+            return False
+        slot_index = self._staging_cache.evict_one()
+        if slot_index is None:
+            return False
+        self.staging_pool.release(slot_index)
+        add_event(
+            "py_kvcache.staging_cache.evict",
+            "kv_staging_cache",
+            now_ns(),
+            0,
+            args={"reason": reason, "size": len(self._staging_cache)},
+        )
+        return True
+
+    def _reserve_foreground_slot(self):
+        # Slot priority: foreground > preload > cache, so reclaim cache then preload.
         slot = self.staging_pool.try_reserve()
+        if slot is None and self._evict_one_cache_slot("foreground_pressure"):
+            slot = self.staging_pool.try_reserve()
         if slot is None and self._evict_one_preload_slot():
             slot = self.staging_pool.try_reserve()
         return slot
+
+    def _reserve_preload_slot(self):
+        # Preload outranks the cache: a speculative read may reclaim a cache slot.
+        slot = self.staging_pool.try_reserve()
+        if slot is None and self._evict_one_cache_slot("preload_pressure"):
+            slot = self.staging_pool.try_reserve()
+        return slot
+
+    def _release_or_cache(self, block_hash: bytes, slot_index: int) -> None:
+        if self._staging_cache is None:
+            self.staging_pool.release(slot_index)
+            return
+        to_release = self._staging_cache.put(block_hash, slot_index)
+        if to_release is not None:
+            self.staging_pool.release(to_release)
+        if to_release != slot_index:
+            add_event(
+                "py_kvcache.staging_cache.insert",
+                "kv_staging_cache",
+                now_ns(),
+                0,
+                args={"size": len(self._staging_cache)},
+            )
+
+    def _settle_load_slot(
+        self,
+        job: "_ReactorJob",
+        file_index: int,
+        slot_index: int,
+        shared: "_SharedPreloadSlot | None",
+        cache: "_CacheSlot | None",
+    ) -> None:
+        # Disk bytes stay valid regardless of the GPU copy outcome (immutable
+        # hash), so success, empty, and error completions all settle here.
+        if cache is not None:
+            self._staging_cache.unpin(cache)
+        elif shared is None:
+            self._release_or_cache(job.block_hashes[file_index], slot_index)
+        else:
+            shared.copies_inflight -= 1
+            self._maybe_release_shared(shared)
+
+    def _schedule_cache_hit(
+        self, job: "_ReactorJob", file_index: int, cache_slot: "_CacheSlot"
+    ) -> None:
+        # Non-destructive: the slot stays in the cache, pinned for the copy's DMA.
+        add_event(
+            "py_kvcache.staging_cache.hit",
+            "kv_staging_cache",
+            now_ns(),
+            0,
+            tid=job.profile.profile_tid,
+            args={"load_job_id": job.job_id, "load_req_id": job.profile.req_id},
+        )
+        self._staging_cache.pin(cache_slot)
+        job.next_file_index += 1
+        job.inflight_files += 1
+        try:
+            self._queue_load_copy(job, file_index, cache_slot.slot_index, cache=cache_slot, source="cache")
+        except BaseException as exc:
+            self._staging_cache.unpin(cache_slot)
+            self._file_terminal(job, ok=False, exc=exc)
 
     def _schedule_work(self) -> bool:
         made = False
@@ -1111,6 +1288,12 @@ class IoReactor:
             while job.failed is None and job.next_file_index < job.total_files:
                 file_index = job.next_file_index
                 h = job.block_hashes[file_index]
+                if self._staging_cache is not None:
+                    cs = self._staging_cache.get(h)
+                    if cs is not None:
+                        self._schedule_cache_hit(job, file_index, cs)
+                        made = True
+                        continue
                 if self._share_preload:
                     if h in self._shared_cached:
                         self._shared_claim_from_cache(job, file_index)
@@ -1152,7 +1335,7 @@ class IoReactor:
             while (
                 job.failed is None
                 and job.next_file_index < job.total_files
-                and self._can_issue_read()
+                and self._can_issue_store()
             ):
                 if not self._schedule_one(job):
                     break
@@ -1216,7 +1399,7 @@ class IoReactor:
     def _drain_ready_load_fds(self) -> bool:
         made = False
         while self._ready_fds_load and self._data_inflight < self.iodepth:
-            slot = self._reserve_load_slot()
+            slot = self._reserve_foreground_slot()
             if slot is None:
                 return made
             ready = self._ready_fds_load.popleft()
@@ -1250,6 +1433,13 @@ class IoReactor:
             return
         if not ok or self._stop:
             return
+        if self._staging_cache is not None and block_hash in self._staging_cache:
+            # Store already cached the bytes; a reuse load hits the cache, so the
+            # re-arm read is redundant. Clear shared demand so refcount does not leak.
+            if self._share_preload:
+                self._purge_owned_for_hash(block_hash)
+                self._preload_refcount.pop(block_hash, None)
+            return
         if self._share_preload:
             # refcount carries multiplicity, so one read-back serves all refholders.
             self._requeue_preload_hash(blocked[0])
@@ -1274,7 +1464,7 @@ class IoReactor:
             if waited:
                 if self._data_inflight >= self.iodepth:
                     return made
-                slot = self._reserve_load_slot()
+                slot = self._reserve_foreground_slot()
                 if slot is None:
                     return made
                 self._ready_fds_preload.popleft()
@@ -1304,7 +1494,7 @@ class IoReactor:
                 continue
             if self._data_inflight >= self.iodepth or not self._can_issue_speculative_preload():
                 return made
-            slot = self.staging_pool.try_reserve()
+            slot = self._reserve_preload_slot()
             if slot is None:
                 return made
             self._ready_fds_preload.popleft()
@@ -1313,7 +1503,7 @@ class IoReactor:
         return made
 
     def _schedule_one(self, job: _ReactorJob) -> bool:
-        slot = self.staging_pool.try_reserve()
+        slot = self._reserve_foreground_slot()
         if slot is None:
             return False
         self._schedule_store_copy(job, job.next_file_index, slot.index)
@@ -1341,7 +1531,7 @@ class IoReactor:
         job.next_file_index += 1
         job.inflight_files += 1
         try:
-            self._queue_load_copy(job, file_index, slot_index)
+            self._queue_load_copy(job, file_index, slot_index, source="preload")
         except BaseException as exc:
             self.staging_pool.release(slot_index)
             self._file_terminal(job, ok=False, exc=exc)
@@ -1389,7 +1579,7 @@ class IoReactor:
         job.inflight_files += 1
         slot.copies_inflight += 1
         try:
-            self._queue_load_copy(job, file_index, slot.slot_index, shared=slot)
+            self._queue_load_copy(job, file_index, slot.slot_index, shared=slot, source="preload")
         except BaseException as exc:
             slot.copies_inflight -= 1
             self._file_terminal(job, ok=False, exc=exc)
@@ -1568,6 +1758,11 @@ class IoReactor:
             self._file_terminal(job, ok=False, exc=exc)
             self._release_store_inflight(job.block_hashes[file_index], ok=False)
             return False
+        # A store occupies one device-budget unit from copy-launch through
+        # write-completion (one unit, two phases): without this, _can_issue_store
+        # never sees in-flight store copies and launches up to slot_count of them,
+        # then drains every write into the SQ in one pump -> SQ overflow.
+        self._data_inflight += 1
         self._pending_copies.append(copy)
         return True
 
@@ -1596,7 +1791,15 @@ class IoReactor:
         slot_index: int,
         *,
         shared: "_SharedPreloadSlot | None" = None,
+        cache: "_CacheSlot | None" = None,
+        source: str = "file",
     ) -> None:
+        if source == "preload":
+            job.n_from_preload += 1
+        elif source == "cache":
+            job.n_from_cache += 1
+        else:
+            job.n_from_file += 1
         output = self._mapping_buffers[slot_index]
         mapping_length = build_block_mapping(
             self._slot_block_ids[slot_index],
@@ -1616,6 +1819,7 @@ class IoReactor:
                 nbytes=self.layout.storage_block_bytes,
                 mapping=mapping,
                 shared=shared,
+                cache=cache,
             )
         )
 
@@ -1659,11 +1863,7 @@ class IoReactor:
         total = sum(rc.mapping_len for rc in ready)
         if total <= 0:
             for rc in ready:
-                if rc.shared is None:
-                    self.staging_pool.release(rc.slot_index)
-                else:
-                    rc.shared.copies_inflight -= 1
-                    self._maybe_release_shared(rc.shared)
+                self._settle_load_slot(rc.job, rc.file_index, rc.slot_index, rc.shared, rc.cache)
                 self._file_terminal(rc.job, ok=True)
             return True
         self._ensure_fused_capacity(total)
@@ -1696,11 +1896,7 @@ class IoReactor:
                 end_event.record(self._copy_stream)
         except BaseException as exc:
             for rc in ready:
-                if rc.shared is None:
-                    self.staging_pool.release(rc.slot_index)
-                else:
-                    rc.shared.copies_inflight -= 1
-                    self._maybe_release_shared(rc.shared)
+                self._settle_load_slot(rc.job, rc.file_index, rc.slot_index, rc.shared, rc.cache)
                 self._file_terminal(rc.job, ok=False, exc=exc)
             return True
         self._pending_copies.append(
@@ -1714,7 +1910,7 @@ class IoReactor:
                 end_event=end_event,
                 nbytes=len(ready) * self.layout.storage_block_bytes,
                 members=[
-                    (rc.slot_index, rc.job, rc.file_index, rc.shared) for rc in ready
+                    (rc.slot_index, rc.job, rc.file_index, rc.shared, rc.cache) for rc in ready
                 ],
             )
         )
@@ -1816,6 +2012,9 @@ class IoReactor:
             cuda_samples=job.cuda_samples,
             num_files=job.total_files,
             num_blocks=job.num_blocks,
+            n_from_file=job.n_from_file,
+            n_from_preload=job.n_from_preload,
+            n_from_cache=job.n_from_cache,
         )
 
     def _slot_view(self, slot_index: int) -> np.ndarray[Any, np.dtype[np.uint8]]:
@@ -1833,9 +2032,17 @@ class TransferCoordinator:
         config: SharedFileConfig,
         file_mapper: FileMapper,
         layout: ParsedKvLayout,
+        break_even: BreakEvenThresholds | None = None,
+        storage_block_tokens: int = 0,
     ) -> None:
         self.layout = layout
-        self.reactor = IoReactor(config=config, file_mapper=file_mapper, layout=layout)
+        self.reactor = IoReactor(
+            config=config,
+            file_mapper=file_mapper,
+            layout=layout,
+            break_even=break_even,
+            storage_block_tokens=storage_block_tokens,
+        )
 
     def submit_store(
         self,

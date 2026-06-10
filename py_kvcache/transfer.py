@@ -279,6 +279,9 @@ def emit_transfer_events(
     cuda_samples: list[Sample],
     num_files: int,
     num_blocks: int,
+    n_from_file: int = 0,
+    n_from_preload: int = 0,
+    n_from_cache: int = 0,
 ) -> None:
     end_ns = now_ns()
     add_event(
@@ -296,6 +299,11 @@ def emit_transfer_events(
             "num_files": num_files,
             "num_blocks": num_blocks,
             "file_io_bw_GBps": _bandwidth(file_samples),
+            # Per-block load source breakdown (zeros for stores). Flat scalars:
+            # the trace viewer renders nested dicts as "[object Object]".
+            "src_file": n_from_file,
+            "src_preload": n_from_preload,
+            "src_cache": n_from_cache,
         },
     )
     file_event = (
