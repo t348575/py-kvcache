@@ -562,11 +562,56 @@ class IoReactor:
         )
 
     def _run(self) -> None:
-        while not (self._stop and not self._has_work()):
-            self._drain_incoming(block=not self._has_work())
-            if self._stop and not self._has_work():
-                break
-            self._pump_once()
+        try:
+            while not (self._stop and not self._has_work()):
+                self._drain_incoming(block=not self._has_work())
+                if self._stop and not self._has_work():
+                    break
+                self._pump_once()
+        except BaseException as exc:
+            # The reactor owns every outstanding transfer Future. If this thread
+            # dies, vLLM blocks forever (loads never free GPU blocks, stores never
+            # signal complete_store -> requests wedge as Running:0 / Deferred:N).
+            # Surface the traceback and fail all outstanding work so the engine
+            # gets errors (recompute/retry) instead of a silent deadlock.
+            logger.exception("py-kvcache reactor thread crashed; failing all outstanding transfers")
+            self._fail_everything(exc)
+
+    def _fail_everything(self, exc: BaseException) -> None:
+        self._stop = True
+        wrapped = RuntimeError("py-kvcache reactor thread crashed")
+        wrapped.__cause__ = exc
+        for job in self._active:
+            if not job.future_set:
+                job.future_set = True
+                try:
+                    job.future.set_exception(wrapped)
+                except BaseException:
+                    pass
+        self._active = []
+        for waiters in list(self._preload_waiters.values()):
+            for job, _fi in waiters:
+                if not job.future_set:
+                    job.future_set = True
+                    try:
+                        job.future.set_exception(wrapped)
+                    except BaseException:
+                        pass
+        self._preload_waiters.clear()
+        # Drain any queued work so submit_job after this fails fast too.
+        with self._submit_lock:
+            self._closed = True
+            while True:
+                try:
+                    item = self._incoming.get_nowait()
+                except queue.Empty:
+                    break
+                if isinstance(item, _ReactorJob) and not item.future_set:
+                    item.future_set = True
+                    try:
+                        item.future.set_exception(wrapped)
+                    except BaseException:
+                        pass
 
     def _drain_incoming(self, *, block: bool) -> None:
         if block:

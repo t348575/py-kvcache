@@ -190,7 +190,15 @@ class LiburingRing:
         head = int(self._sq_head[0])
         tail = int(self._sq_tail[0])
         if tail - head >= self._params.sq_entries:
-            raise BlockingIOError(errno.EAGAIN, "io_uring submission queue is full")
+            # A single pump can queue more SQEs than the ring holds (reads +
+            # writes + opens + a burst of trailing closes). Flush what is queued
+            # to the kernel (non-blocking; frees every SQ slot) and retry rather
+            # than raising — a full SQ is backpressure, not an error.
+            self.submit_pending()
+            head = int(self._sq_head[0])
+            tail = int(self._sq_tail[0])
+            if tail - head >= self._params.sq_entries:
+                raise BlockingIOError(errno.EAGAIN, "io_uring submission queue is full")
         index = tail & int(self._sq_mask[0])
         sqe = self._sqes[index]
         ctypes.memset(ctypes.byref(sqe), 0, ctypes.sizeof(_IoUringSqe))
