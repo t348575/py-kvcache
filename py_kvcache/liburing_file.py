@@ -12,7 +12,6 @@ from .fs_config import SharedFileConfig
 from .profiling import add_event, now_ns
 
 DIRECT_IO_ALIGNMENT = 4096
-DEFAULT_IODEPTH = 256
 DEFAULT_CREATE_MODE = 0o666
 
 _LIBC = ctypes.CDLL(None, use_errno=True)
@@ -332,7 +331,7 @@ class DirectIoFileStore:
         self.config = config
         self.payload_size = payload_size
         self.io_size = align_up(payload_size)
-        self.iodepth = max(1, config.iodepth or DEFAULT_IODEPTH)
+        self.iodepth = max(1, config.iodepth)
         if not hasattr(os, "O_DIRECT"):
             raise RuntimeError("direct I/O requires os.O_DIRECT support")
 
@@ -466,7 +465,6 @@ class DirectIoFileStore:
 
 
 __all__ = [
-    "DEFAULT_IODEPTH",
     "DIRECT_IO_ALIGNMENT",
     "DirectIoFileStore",
     "LiburingRing",

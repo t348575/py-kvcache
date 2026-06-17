@@ -3,6 +3,9 @@ from __future__ import annotations
 from collections.abc import Mapping
 from dataclasses import dataclass
 
+DEFAULT_IODEPTH = 16
+DEFAULT_STAGING_MEM_GIB = 1.0
+
 
 def _coerce_str(value: object | None, *, field_name: str) -> str | None:
     if value is None:
@@ -61,8 +64,8 @@ def _validate_positive(value: int | None, *, field_name: str) -> None:
 class SharedFileConfig:
     root_dir: str
     sync_on_store: bool = False
-    iodepth: int | None = None
-    staging_mem: float | None = None
+    iodepth: int = DEFAULT_IODEPTH
+    staging_mem: float = DEFAULT_STAGING_MEM_GIB
     enable_preload: bool = False
     # When on, identical-prefix preload candidates share one disk read + one staging
     # slot, released by a reference counter once all demanders are served.
@@ -130,8 +133,8 @@ class SharedFileConfig:
         return cls(
             root_dir=root_dir,
             sync_on_store=False if sync_on_store is None else sync_on_store,
-            iodepth=iodepth,
-            staging_mem=staging_mem,
+            iodepth=DEFAULT_IODEPTH if iodepth is None else iodepth,
+            staging_mem=DEFAULT_STAGING_MEM_GIB if staging_mem is None else staging_mem,
             enable_preload=False if enable_preload is None else enable_preload,
             preload_share_staging=(
                 True if preload_share_staging is None else preload_share_staging

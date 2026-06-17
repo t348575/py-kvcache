@@ -21,11 +21,11 @@ class StagingPool:
     @staticmethod
     def compute_slot_count(
         *,
-        staging_mem_gib: float | None,
+        staging_mem_gib: float,
         io_size: int,
         min_slots: int = 1,
     ) -> int:
-        staging_bytes = int((staging_mem_gib if staging_mem_gib is not None else 1.0) * (1 << 30))
+        staging_bytes = int(staging_mem_gib * (1 << 30))
         return max(max(1, min_slots), max(1, staging_bytes // io_size))
 
     @property

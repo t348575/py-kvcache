@@ -16,7 +16,6 @@ from .break_even import BreakEvenThresholds, should_load
 from .file_mapper import FileMapper
 from .fs_config import SharedFileConfig
 from .liburing_file import (
-    DEFAULT_IODEPTH,
     DirectIoFileStore,
     LiburingRing,
     align_up,
@@ -187,7 +186,7 @@ class IoReactor:
         payload_size = layout.storage_block_bytes
         io_size = align_up(payload_size)
         self.file_store = DirectIoFileStore(config, payload_size=payload_size)
-        self.iodepth = max(1, config.iodepth or DEFAULT_IODEPTH)
+        self.iodepth = max(1, config.iodepth)
         # Floor above iodepth so slots held by CUDA copies don't starve new reads.
         self._copy_headroom = max(4, self.iodepth // 2)
         min_slots = self.iodepth + self._copy_headroom
