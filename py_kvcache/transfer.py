@@ -99,6 +99,15 @@ class ParsedKvLayout:
     def gpu_blocks_per_storage_block(self) -> int:
         return self.storage_block_size_factor
 
+    @property
+    def staging_layer_offsets(self) -> list[int]:
+        offsets: list[int] = []
+        acc = 0
+        for nbytes in self.bytes_per_kernel_block:
+            offsets.append(acc)
+            acc += self.storage_block_size_factor * nbytes
+        return offsets
+
     @classmethod
     def from_canonical_kv_caches(
         cls,
@@ -120,12 +129,6 @@ class ParsedKvLayout:
             raise ValueError("at least one KV cache tensor must be registered")
 
         parsed_gpu_tensors = [kv_cache.tensor for kv_cache in kv_caches.tensors]
-        if len(parsed_gpu_tensors) != 1:
-            raise ValueError(
-                "py-kvcache requires exactly one canonical KV cache tensor "
-                "(direct-staging only); got "
-                f"{len(parsed_gpu_tensors)}"
-            )
         for tensor in parsed_gpu_tensors:
             if tensor.dtype != torch.int8:
                 raise ValueError("canonical KV cache tensors must use int8 dtype")
@@ -148,23 +151,15 @@ class ParsedKvLayout:
             pin_memory=is_pin_memory_available(),
         )
 
-    def allocate_staging_tensors(self, slot_count: int) -> list[Any]:
+    def allocate_staging_buffer(self, slot_count: int) -> Any:
         if not TORCH_COPY_AVAILABLE:
             raise RuntimeError("vLLM and torch are required for GPU copy support")
-        num_kernel_blocks = slot_count * self.storage_block_size_factor
-        staging_tensors: list[Any] = []
-        for gpu_tensor in self.gpu_tensors:
-            shape = list(gpu_tensor.shape)
-            shape[0] = num_kernel_blocks
-            staging_tensors.append(
-                torch.empty(
-                    shape,
-                    dtype=gpu_tensor.dtype,
-                    device="cpu",
-                    pin_memory=self.pin_memory,
-                )
-            )
-        return staging_tensors
+        return torch.empty(
+            (slot_count, self.storage_block_bytes),
+            dtype=torch.uint8,
+            device="cpu",
+            pin_memory=self.pin_memory,
+        )
 
     @staticmethod
     def _byte_array_view(tensor: Any) -> np.ndarray:
@@ -175,12 +170,10 @@ class ParsedKvLayout:
 
     def storage_slot_view(
         self,
-        staging_tensors: list[Any],
+        staging_buffer: Any,
         slot_index: int,
     ) -> np.ndarray[Any, np.dtype[np.uint8]]:
-        start = slot_index * self.storage_block_size_factor
-        end = start + self.storage_block_size_factor
-        view = self._byte_array_view(staging_tensors[0][start:end])
+        view = self._byte_array_view(staging_buffer[slot_index])
         if view.nbytes != self.storage_block_bytes:
             raise ValueError(
                 f"staging slot view size {view.nbytes} does not match storage "

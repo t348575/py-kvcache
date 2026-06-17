@@ -49,15 +49,12 @@ logger = logging.getLogger(__name__)
 
 
 class LoadDeclined(Exception):
-    """A load gated out by break-even: its GPU blocks must be recomputed.
+    """Load skipped by break-even; block ids must be recomputed."""
 
-    Carries the destination GPU block ids so the handler can surface them as
-    vLLM `invalid_block_ids`. Not an error — the load was deliberately skipped.
-    """
-
-    def __init__(self, block_ids: list[int]) -> None:
+    def __init__(self, block_ids: list[int], req_id: str = "") -> None:
         super().__init__("load declined by prefix-cache break-even gate")
         self.block_ids = block_ids
+        self.req_id = req_id
 
 
 @dataclass
@@ -199,7 +196,8 @@ class IoReactor:
             io_size=io_size,
             min_slots=min_slots,
         )
-        self.staging_tensors = layout.allocate_staging_tensors(slot_count)
+        self.staging_buffer = layout.allocate_staging_buffer(slot_count)
+        self._staging_base_ptr = self.staging_buffer.data_ptr()
         self.staging_pool = StagingPool(slot_count=slot_count)
         if slot_count <= min_slots:
             logger.warning(
@@ -766,7 +764,7 @@ class IoReactor:
             },
         )
         job.future_set = True
-        job.future.set_exception(LoadDeclined(block_ids))
+        job.future.set_exception(LoadDeclined(block_ids, req_id=job.profile.req_id))
 
     def _pump_once(self) -> bool:
         made = False
@@ -1790,8 +1788,6 @@ class IoReactor:
             )
             copy = self._launch_swap_blocks(
                 slot_index,
-                self.layout.gpu_tensors[0],
-                self.staging_tensors[0],
                 src_to_dst,
                 self.layout.storage_block_bytes,
                 is_store=True,
@@ -1880,21 +1876,42 @@ class IoReactor:
         self._fused_sizes_t = torch.from_numpy(self._fused_sizes_np)
         self._fused_capacity = cap
 
-    @staticmethod
     def _fill_swap_ptrs(
+        self,
         mapping: np.ndarray,
-        src_tensor: Any,
-        dst_tensor: Any,
-        block_bytes: int,
+        slot_index: int,
+        staging_is_src: bool,
         src_arr: np.ndarray,
         dst_arr: np.ndarray,
         sizes_arr: np.ndarray,
         offset: int,
     ) -> int:
-        end = offset + mapping.shape[0]
-        src_arr[offset:end] = src_tensor.data_ptr() + mapping[:, 0] * block_bytes
-        dst_arr[offset:end] = dst_tensor.data_ptr() + mapping[:, 1] * block_bytes
-        sizes_arr[offset:end] = block_bytes
+        """Fill swap_blocks pointer arrays for one staging slot."""
+        layout = self.layout
+        factor = layout.storage_block_size_factor
+        slot_base = self._staging_base_ptr + slot_index * layout.storage_block_bytes
+        if staging_is_src:
+            staging_local = mapping[:, 0] - slot_index * factor
+            gpu_blocks = mapping[:, 1]
+        else:
+            gpu_blocks = mapping[:, 0]
+            staging_local = mapping[:, 1] - slot_index * factor
+        rows = mapping.shape[0]
+        end = offset
+        for gpu_tensor, block_bytes, layer_offset in zip(
+            layout.gpu_tensors, layout.bytes_per_kernel_block, layout.staging_layer_offsets
+        ):
+            start = end
+            end = start + rows
+            staging_ptr = slot_base + layer_offset + staging_local * block_bytes
+            gpu_ptr = gpu_tensor.data_ptr() + gpu_blocks * block_bytes
+            if staging_is_src:
+                src_arr[start:end] = staging_ptr
+                dst_arr[start:end] = gpu_ptr
+            else:
+                src_arr[start:end] = gpu_ptr
+                dst_arr[start:end] = staging_ptr
+            sizes_arr[start:end] = block_bytes
         return end
 
     def _flush_copy_batch(self) -> bool:
@@ -1902,16 +1919,13 @@ class IoReactor:
         if not ready:
             return False
         self._copy_ready = []
-        staging_tensor = self.staging_tensors[0]
-        gpu_tensor = self.layout.gpu_tensors[0]
-        block_bytes = self.layout.bytes_per_kernel_block[0]
         total = sum(rc.mapping_len for rc in ready)
         if total <= 0:
             for rc in ready:
                 self._settle_load_slot(rc.job, rc.file_index, rc.slot_index, rc.shared, rc.cache)
                 self._file_terminal(rc.job, ok=True)
             return True
-        self._ensure_fused_capacity(total)
+        self._ensure_fused_capacity(total * len(self.layout.gpu_tensors))
         src = self._fused_src_np
         dst = self._fused_dst_np
         sizes = self._fused_sizes_np
@@ -1925,9 +1939,8 @@ class IoReactor:
                 for rc in ready:
                     offset = self._fill_swap_ptrs(
                         rc.mapping,
-                        staging_tensor,
-                        gpu_tensor,
-                        block_bytes,
+                        rc.slot_index,
+                        True,
                         src,
                         dst,
                         sizes,
@@ -1964,8 +1977,6 @@ class IoReactor:
     def _launch_swap_blocks(
         self,
         slot_index: int,
-        src_tensor: Any,
-        dst_tensor: Any,
         src_to_dst: Any,
         sample_nbytes: int,
         *,
@@ -1986,9 +1997,8 @@ class IoReactor:
                 mapping = self._mapping_buffers[slot_index][:mapping_len]
                 offset = self._fill_swap_ptrs(
                     mapping,
-                    src_tensor,
-                    dst_tensor,
-                    self.layout.bytes_per_kernel_block[0],
+                    slot_index,
+                    not is_store,
                     self._batch_src_ptrs[slot_index],
                     self._batch_dst_ptrs[slot_index],
                     self._batch_sizes[slot_index],
@@ -2063,7 +2073,7 @@ class IoReactor:
         )
 
     def _slot_view(self, slot_index: int) -> np.ndarray[Any, np.dtype[np.uint8]]:
-        return self.layout.storage_slot_view(self.staging_tensors, slot_index)
+        return self.layout.storage_slot_view(self.staging_buffer, slot_index)
 
     def _new_user_data(self) -> int:
         self._next_user_data += 1

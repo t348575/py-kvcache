@@ -271,9 +271,10 @@ class NoopSharedStorageOffloadingHandler(OffloadingHandler):
         self.coordinator = coordinator
         self._active: dict[int, tuple[Future[int], float, tuple[str, str]]] = {}
         self._finished: dict[int, TransferResult] = {}
-        # GPU block ids of loads declined by the break-even gate; drained by the
-        # connector worker into vLLM invalid_block_ids so the scheduler recomputes.
+        # Break-even declines reported to vLLM for recompute.
         self._declined_block_ids: set[int] = set()
+        # Sticky req_ids suppress repeated declined loads.
+        self._declined_req_ids: set[str] = set()
         # Bounded FIFO dedup; evicted ids can be re-submitted (reactor deduplicates by hash).
         self._submitted_preload_ids: "collections.OrderedDict[str, None]" = (
             collections.OrderedDict()
@@ -390,11 +391,17 @@ class NoopSharedStorageOffloadingHandler(OffloadingHandler):
         return results
 
     def get_declined_block_ids(self) -> set[int]:
-        """Drain GPU block ids of break-even-declined loads (recompute targets)."""
         if not self._declined_block_ids:
             return set()
         declined = self._declined_block_ids
         self._declined_block_ids = set()
+        return declined
+
+    def get_declined_req_ids(self) -> set[str]:
+        if not self._declined_req_ids:
+            return set()
+        declined = self._declined_req_ids
+        self._declined_req_ids = set()
         return declined
 
     def wait(self, job_ids: set[int]) -> None:
@@ -444,9 +451,10 @@ class NoopSharedStorageOffloadingHandler(OffloadingHandler):
                 transfer_type=transfer_type,
             )
         except LoadDeclined as declined:
-            # Not a failure: the load was gated out. Report the job complete so
-            # the request resumes, and surface its blocks for recompute.
+            # Declined loads complete with recompute metadata.
             self._declined_block_ids.update(declined.block_ids)
+            if declined.req_id:
+                self._declined_req_ids.add(declined.req_id)
             return _make_transfer_result(
                 job_id=job_id,
                 success=True,
