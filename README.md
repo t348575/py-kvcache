@@ -4,7 +4,7 @@
 </p>
 
 <p align="center">
-  py-kvcache is a python KV cache offloading engine for vLLM, designed to be used with a storage interface supporting direct I/O with `io_uring`. It implements vLLM's `OffloadingConnector` and stores KV blocks as immutable, hash-addressed files on a filesystem shared by the participating workers.
+  py-kvcache is a python KV cache offloading engine for vLLM, designed to be used with a storage interface supporting direct I/O with iouring. It implements vLLM's OffloadingConnector and stores KV blocks as immutable, hash-addressed files on a filesystem shared by the participating workers.
 </p>
 
 **The project is meant for experimentation**.
