@@ -7,7 +7,6 @@
   py-kvcache is a python KV cache offloading engine for vLLM, designed to be used with a storage interface supporting direct I/O with iouring. It implements vLLM's OffloadingConnector and stores KV blocks as immutable, hash-addressed files on a filesystem shared by the participating workers.
 </p>
 
-**The project is meant for experimentation**.
 
 **Important notes:**
 * The cache can serve only a single model at a time.
@@ -23,7 +22,7 @@
 - Runs storage transfers through one Python reactor thread with one `io_uring` ring.
 - Can preload KV for upcoming requests. The scheduler looks ahead at the next waiting requests and the reactor pre-reads their blocks into CPU staging during background stores or idle time.
 - Support for running with a DRAM cache with LRU or ARC (write-through).
-- Supports gaiting kvcache load & store ops using a calculated break-even curve. When a prefix too short to be worth it, a disk or DRAM read is declined and recomputed on the GPU instead. The break-even curve can be calculated using the `pareto_measure` script in [t348575/kvcache-experiments](https://github.com/t348575/kvcache-experiments).
+- Supports gating kvcache load & store ops using a calculated break-even curve. When a prefix is too short to be worth it, a disk or DRAM read is declined and recomputed on the GPU instead. The break-even curve can be calculated using the `pareto_measure` script in [t348575/kvcache-experiments](https://github.com/t348575/kvcache-experiments#scriptspareto_measurepy).
 
 There is no cache index, cleanup, garbage collection, or eviction policy for the files.
 
@@ -124,7 +123,7 @@ The stock vLLM `OffloadingConnector` only stores and loads KV on demand. Preload
 
 The goal is to let the storage backend start reading a waiting request's KV *before* that request is scheduled, so its load is already in CPU memory when it runs, and will only require a much faster CPU->GPU copy.
 
-1. At each scheduling step the scheduler sends the next N requests them to the offloading connector (`_notify_preload_candidates` / `_get_preload_candidate_requests` in the v1 scheduler).
+1. At each scheduling step the scheduler sends the next N requests to the offloading connector (`_notify_preload_candidates` / `_get_preload_candidate_requests` in the v1 scheduler).
 2. The offloading connector then calculates if the request has a stored prefix (and how much), and forwards it to the vLLM worker as a preload hint using the `reqs_to_preload` field.
 3. The vLLM worker then forwards the hint to the external kvcache calling `preload_async(preload_id, ...)` to start the speculative read. When the actual load for the request happens i.e. when the scheduler starts executing it, the worker calls `load_from_preload_async(...)` passing `preload_id`.
 
@@ -132,7 +131,7 @@ The connector does not check whether the blocks exist on disk (or cache) before 
 
 ### Break-even gating
 
-Through testing, a clear break-even point exists for kv-caching, when the cost of loading is lower than re-computing the prefix. This break-even point is setup specific (GPU, LLM model, SSD). The vLLM scheduler uses the break-even data to determine when a load from either CPU DRAM or disk is worth it. If the prefix size is less than the break-even, then the load & store ops are declined. 
+Through testing, a clear break-even point exists for kv caching, when the cost of loading is lower than re-computing the prefix. This break-even point is setup specific (GPU, LLM model, SSD). The vLLM scheduler uses the break-even data to determine when a load from either CPU DRAM or disk is worth it. If the prefix size is less than the break-even, then the load & store ops are declined.
 
 These changes are added to the vLLM fork [t348575/vllm](https://github.com/t348575/vllm).
 
