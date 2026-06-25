@@ -73,7 +73,7 @@ All options are passed through `kv_connector_extra_config`.
 | `enable_preload` | no | `false` | Kv offload connector, scheduler, and vLLM scheduler work to preemptively load entries from disk to CPU DRAM before they actually need to run. |
 | `preload_lookahead_requests` | no | 0 | Number of upcoming requests the scheduler will try to preload at each step. Ensure this is > 0 when setting `enable_preload`. Ensure `staging_mem` is large enough to preload many requests. |
 | `preload_share_staging` | no | `true` | Share one disk read and one staging slot across multiple preload candidates. This is intended for experiments, leave on. |
-| `open_lookahead` | no | `iodepth` | Used to reduce latency from open to read, by opening files before they are actually read, useful in prefix loads. |
+| `open_lookahead` | no | `iodepth` | Used to reduce latency from open to read, by opening files before they are actually read. |
 | `staging_cache` | no | `off` | Write-through DRAM cache: `off`, `lru`, or `arc`. Functions as a regular cache for load operations, in a write-through manner. Evictions are removed, not flushed to disk. |
 | `prefix_cache_break_even_path` | no | none | Path to a JSON file with break-even data (setup specific). Ops below the threshold are denied, and are computed instead. |
 
