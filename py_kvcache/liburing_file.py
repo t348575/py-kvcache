@@ -436,8 +436,14 @@ class DirectIoFileStore:
     def _validate_io_array(self, array: np.ndarray) -> None:
         if array.nbytes < self.io_size:
             raise ValueError("I/O array is smaller than aligned I/O size")
-        if array.ctypes.data % DIRECT_IO_ALIGNMENT != 0:
-            raise ValueError("I/O array is not aligned for direct I/O")
+        address = int(array.ctypes.data)
+        remainder = address % DIRECT_IO_ALIGNMENT
+        if remainder:
+            raise ValueError(
+                "I/O array is not aligned for direct I/O: "
+                f"address=0x{address:x}, alignment={DIRECT_IO_ALIGNMENT}, "
+                f"remainder={remainder}"
+            )
         if not array.flags.c_contiguous:
             raise ValueError("I/O array must be contiguous")
 

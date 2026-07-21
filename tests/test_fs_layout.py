@@ -75,6 +75,34 @@ class SharedFileConfigTests(unittest.TestCase):
 
 
 class FileMapperTests(unittest.TestCase):
+    def test_rejects_absolute_model_name(self) -> None:
+        with self.assertRaisesRegex(ValueError, "model_name must be relative"):
+            FileMapper(
+                root_dir="/cache",
+                model_name="/models/llama",
+                gpu_block_size=16,
+                gpu_blocks_per_file=1,
+                tp_size=1,
+                pp_size=1,
+                pcp_size=1,
+                rank=0,
+                dtype="float16",
+            )
+
+    def test_rejects_model_name_that_escapes_root(self) -> None:
+        with self.assertRaisesRegex(ValueError, "model_name must not escape"):
+            FileMapper(
+                root_dir="/cache",
+                model_name="../models/llama",
+                gpu_block_size=16,
+                gpu_blocks_per_file=1,
+                tp_size=1,
+                pp_size=1,
+                pcp_size=1,
+                rank=0,
+                dtype="float16",
+            )
+
     def test_uses_llmd_style_directory_layout(self) -> None:
         mapper = FileMapper(
             root_dir="/mnt/files-storage/kv-cache/",

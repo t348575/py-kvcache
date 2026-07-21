@@ -19,9 +19,16 @@ class FileMapper:
         rank: int,
         dtype: str,
     ) -> None:
+        if os.path.isabs(model_name):
+            raise ValueError("model_name must be relative to root_dir")
+        normalized_model_name = os.path.normpath(model_name)
+        if normalized_model_name == ".." or normalized_model_name.startswith(
+            f"..{os.sep}"
+        ):
+            raise ValueError("model_name must not escape root_dir")
         self.base_path = os.path.join(
             root_dir,
-            model_name,
+            normalized_model_name,
             f"block_size_{gpu_block_size}_blocks_per_file_{gpu_blocks_per_file}",
             f"tp_{tp_size}_pp_size_{pp_size}_pcp_size_{pcp_size}",
             f"rank_{rank}",

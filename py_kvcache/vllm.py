@@ -574,15 +574,20 @@ def _make_transfer_result(
             SharedStorageLoadStoreSpec.medium(),
             GPULoadStoreSpec.medium(),
         )
+    result_kwargs = {
+        "job_id": job_id,
+        "success": success,
+        "transfer_size": transfer_size,
+        "transfer_time": transfer_time,
+        "transfer_type": transfer_type,
+    }
+    if message is not None:
+        try:
+            return TransferResult(**result_kwargs, error_msg=message)
+        except TypeError:
+            pass
     try:
-        return TransferResult(
-            job_id=job_id,
-            success=success,
-            transfer_size=transfer_size,
-            transfer_time=transfer_time,
-            transfer_type=transfer_type,
-            error_msg=message,
-        )
+        return TransferResult(**result_kwargs)
     except TypeError:
         try:
             return TransferResult(job_id=job_id, success=success)

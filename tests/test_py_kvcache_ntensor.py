@@ -12,11 +12,14 @@ from __future__ import annotations
 
 import unittest
 from types import SimpleNamespace
+from unittest.mock import patch
 
 try:
     import numpy as np
 
     from py_kvcache.reactor import IoReactor
+    from py_kvcache import transfer
+    from py_kvcache.liburing_file import DIRECT_IO_ALIGNMENT
     from py_kvcache.transfer import ParsedKvLayout
 
     HAVE_DEPS = True
@@ -48,6 +51,41 @@ class StagingLayerOffsetsTest(unittest.TestCase):
         layout = self._layout([16, 8], factor=2)
         self.assertEqual(layout.staging_layer_offsets, [0, 32])
         self.assertEqual(layout.storage_block_bytes, 2 * (16 + 8))
+
+
+@unittest.skipUnless(HAVE_DEPS, "numpy / py_kvcache not importable")
+class StagingBufferAlignmentTest(unittest.TestCase):
+    def test_all_slots_are_direct_io_aligned(self):
+        layout = ParsedKvLayout(
+            gpu_tensors=[None],
+            bytes_per_kernel_block=[DIRECT_IO_ALIGNMENT],
+            storage_block_size_factor=1,
+            pin_memory=False,
+        )
+        real_empty = transfer.torch.empty
+
+        def misaligned_empty(shape, **kwargs):
+            numel = int(np.prod(shape))
+            backing = real_empty((numel + 1,), **kwargs)
+            return backing.narrow(0, 1, numel).view(shape)
+
+        with patch.object(transfer.torch, "empty", side_effect=misaligned_empty):
+            buffer = layout.allocate_staging_buffer(slot_count=3)
+
+        self.assertEqual(buffer.data_ptr() % DIRECT_IO_ALIGNMENT, 0)
+        for slot in buffer:
+            self.assertEqual(slot.data_ptr() % DIRECT_IO_ALIGNMENT, 0)
+
+    def test_rejects_unaligned_slot_stride(self):
+        layout = ParsedKvLayout(
+            gpu_tensors=[None],
+            bytes_per_kernel_block=[DIRECT_IO_ALIGNMENT - 1],
+            storage_block_size_factor=1,
+            pin_memory=False,
+        )
+
+        with self.assertRaisesRegex(ValueError, "not divisible"):
+            layout.allocate_staging_buffer(slot_count=1)
 
 
 @unittest.skipUnless(HAVE_DEPS, "numpy / py_kvcache not importable")

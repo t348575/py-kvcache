@@ -5,6 +5,7 @@ from typing import Any
 
 import numpy as np
 
+from .liburing_file import DIRECT_IO_ALIGNMENT
 from .profiling import add_event, now_ns
 
 try:
@@ -154,12 +155,26 @@ class ParsedKvLayout:
     def allocate_staging_buffer(self, slot_count: int) -> Any:
         if not TORCH_COPY_AVAILABLE:
             raise RuntimeError("vLLM and torch are required for GPU copy support")
-        return torch.empty(
-            (slot_count, self.storage_block_bytes),
+
+        slot_bytes = self.storage_block_bytes
+        if slot_bytes % DIRECT_IO_ALIGNMENT != 0:
+            raise ValueError(
+                f"storage block size {slot_bytes} is not divisible by direct-I/O "
+                f"alignment {DIRECT_IO_ALIGNMENT}"
+            )
+
+        payload_bytes = slot_count * slot_bytes
+        backing = torch.empty(
+            (payload_bytes + DIRECT_IO_ALIGNMENT - 1,),
             dtype=torch.uint8,
             device="cpu",
             pin_memory=self.pin_memory,
         )
+        offset = (-backing.data_ptr()) % DIRECT_IO_ALIGNMENT
+        aligned = backing.narrow(0, offset, payload_bytes)
+        if aligned.data_ptr() % DIRECT_IO_ALIGNMENT != 0:
+            raise RuntimeError("failed to align staging allocation")
+        return aligned.view(slot_count, slot_bytes)
 
     @staticmethod
     def _byte_array_view(tensor: Any) -> np.ndarray:
