@@ -464,10 +464,6 @@ class SpecConfigValidationTest(unittest.TestCase):
         self.assertFalse(vmod.VLLM_AVAILABLE)
         self.assertIsNotNone(self._build()._planner)
 
-    def test_local_prefix_caching_enabled_raises(self) -> None:
-        with self.assertRaises(ValueError):
-            self._build(enable_prefix_caching=True)
-
     def test_missing_kv_bytes_per_token_raises(self) -> None:
         payload = dict(_V2_CURVES)
         payload = {k: v for k, v in payload.items() if k != "kv_bytes_per_token"}

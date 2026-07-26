@@ -697,10 +697,8 @@ class PyKvCacheOffloadingSpec(OffloadingSpec):
             raise ValueError("load_planner=on requires preload_lookahead_requests > 0")
 
         if bool(_get_nested_attr(vllm_config, ("cache_config", "enable_prefix_caching"), False)):
-            raise ValueError(
-                "load_planner=on is incompatible with local GPU prefix caching "
-                "(vllm_config.cache_config.enable_prefix_caching); the planner prices "
-                "recompute_tokens as the 0%-prefix token count"
+            logger.warning(
+                "load_planner=on with local GPU prefix caching enabled! This means recompute is overpriced."
             )
 
         if curves.kv_bytes_per_token is None:
