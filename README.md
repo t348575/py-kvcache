@@ -4,27 +4,28 @@
 </p>
 
 <p align="center">
-  py-kvcache is a python KV cache offloading engine for vLLM, designed to be used with a storage interface supporting direct I/O with iouring. It implements vLLM's OffloadingConnector and stores KV blocks as immutable, hash-addressed files on a filesystem shared by the participating workers.
+  py-kvcache is a python KV cache offloading engine for vLLM, using direct I/O with iouring through vLLM's OffloadingConnector.
 </p>
 
 
-**Important notes:**
-* The cache can serve only a single model at a time.
-* Requires various changes in vllm kv offload API as well as the scheduler, available in my vllm fork [t348575/vllm](https://github.com/t348575/vllm).
-* Requires the profiler [t348575/simple-profiler](https://github.com/t348575/simple-profiler/).
+## Features
 
-## What it does & Features
-
-- Checks whether offloaded KV blocks already exist in shared storage.
+- Checks whether offloaded KV blocks exist in shared storage.
 - Stores missing KV blocks as files named by the vLLM block hash.
-- Loads stored blocks back into GPU KV cache tensors.
+- Loads stored blocks back into GPU KV cache tensors (DMA copies).
 - Uses pinned CPU staging tensors between GPU memory and file I/O.
-- Runs storage transfers through one Python reactor thread with one `io_uring` ring.
+- Runs storage transfers through one Python reactor thread with one `iouring` ring.
 - Can preload KV for upcoming requests. The scheduler looks ahead at the next waiting requests and the reactor pre-reads their blocks into CPU staging during background stores or idle time.
-- Support for running with a DRAM cache with LRU or ARC (write-through).
-- Supports gating kvcache load & store ops using a calculated break-even curve. When a prefix is too short to be worth it, a disk or DRAM read is declined and recomputed on the GPU instead. The break-even curve can be calculated using the `pareto_measure` script in [t348575/kvcache-experiments](https://github.com/t348575/kvcache-experiments#scriptspareto_measurepy).
+- Supports running with a DRAM cache with LRU or ARC (write-through).
+- Supports gating load & store ops using a calculated break-even curve. When a prefix is too short to be worth it, a disk or DRAM read is declined and recomputed on the GPU instead. The break-even curve can be calculated using the `pareto_measure` script in [t348575/kvcache-experiments](https://github.com/t348575/kvcache-experiments#scriptspareto_measurepy).
+- Supports a cost-model load planner (`load_planner=on`). It uses the measured curves (from the `pareto_measure` script), and picks one of three outcomes per waiting request: load it now, defer it so its blocks stage into DRAM in the background first, or skip the load and let the GPU recompute the prefix. This allows small requests in the queue to effectivly skip ahead over large requests, reducing their TTFT, while having little to no effect on the TTFT of the large waiting request.
 
 There is no cache index, cleanup, garbage collection, or eviction policy for the files.
+
+**Important:**
+* py-kvcache can only serve a single model at a time.
+* Requires various changes in vllm kv offload API as well as the scheduler, available in my vllm fork [t348575/vllm](https://github.com/t348575/vllm).
+* Requires the profiler [t348575/simple-profiler](https://github.com/t348575/simple-profiler/).
 
 ## Install
 
@@ -54,6 +55,10 @@ kv_transfer_config = KVTransferConfig(
         "preload_share_staging": True,
         "open_lookahead": 16,
         "staging_cache": "off",
+        "prefix_cache_break_even_path": "break-even-h100.json",
+        "load_planner": "on",
+        "load_planner_defer_tolerance": 2.0,
+        "load_planner_defer_deadline_max_s": 2.0,
     },
 )
 ```
@@ -75,7 +80,10 @@ All options are passed through `kv_connector_extra_config`.
 | `preload_share_staging` | no | `true` | Share one disk read and one staging slot across multiple preload candidates. This is intended for experiments, leave on. |
 | `open_lookahead` | no | `iodepth` | Used to reduce latency from open to read, by opening files before they are actually read. |
 | `staging_cache` | no | `off` | Write-through DRAM cache: `off`, `lru`, or `arc`. Functions as a regular cache for load operations, in a write-through manner. Evictions are removed, not flushed to disk. |
-| `prefix_cache_break_even_path` | no | none | Path to a JSON file with break-even data (setup specific). Ops below the threshold are denied, and are computed instead. |
+| `prefix_cache_break_even_path` | no | none | Path to a JSON file with break-even data, used for gating KV as well as by the load planner for estimating load times. |
+| `load_planner` | no | `off` | `off` or `on`. Does pseudo scheduling of requests by choosing load / defer / recompute per request to minimise mean TTFT. |
+| `load_planner_defer_tolerance` | no | 2.0 | How many multiples of its own predicted storage wait a deferred request will keep waiting for its speculative read. Past that it is admitted for a normal foreground load. |
+| `load_planner_defer_deadline_max_s` | no | 2.0 | Upper clamp in seconds on that per-request deferral, whatever the tolerance works out to. |
 
 ## Filesystem layout
 
@@ -138,3 +146,11 @@ These changes are added to the vLLM fork [t348575/vllm](https://github.com/t3485
 `scripts/pareto_measure.py` in [t348575/kvcache-experiments](https://github.com/t348575/kvcache-experiments) can be used to generate a pareto plot, and the break-even point for your setup.
 
 `scripts/emit_break_even.py` can be used to generate the json break even data for vLLM to use.
+
+### Cost-model load planner
+
+The planner scores every candidate in the preload lookahead window, returning `ADMIT` (load from storage now), `DEFER` (park the request for a step while its blocks stage into DRAM) or `DECLINE` (no cache hit, the GPU recomputes the prefix), whichever the measured TTFT curves predict is fastest given the storage and GPU work already booked ahead of it.
+
+The effect is that requests with long prefixes are deferred instead of putting a long SSD read at the head of the storage queue, so the short requests behind them run first and get a very low TTFT. The deferred requests barely pay for it, their read completes into DRAM while the requests ahead of them prefill, so their load is a staging hit by the time they are admitted.
+
+A request is not deferred indefinitely. The first time it defers, the planner arms a deadline of `min(load_planner_defer_deadline_max_s, max(50ms, load_planner_defer_tolerance * predicted_read_completion))`, where `predicted_read_completion` is when that request's own speculative read is expected to finish, counting the storage queue already ahead of it. The tolerance scales the wait to the request's own predicted read rather than a fixed timeout, and the clamp bounds what a bad prediction can cost. Past the deadline it is admitted for a normal foreground load.

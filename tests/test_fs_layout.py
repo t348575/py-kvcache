@@ -73,6 +73,78 @@ class SharedFileConfigTests(unittest.TestCase):
                 {"shared_storage_path": "/mnt/shared-kv", "staging_cache": "fifo"}
             )
 
+    def test_load_planner_defaults_off(self) -> None:
+        config = SharedFileConfig.from_extra_config({"shared_storage_path": "/mnt/shared-kv"})
+        self.assertEqual(config.load_planner, "off")
+
+    def test_parses_load_planner(self) -> None:
+        for value, expected in (("ON", "on"), ("off", "off")):
+            config = SharedFileConfig.from_extra_config(
+                {"shared_storage_path": "/mnt/shared-kv", "load_planner": value}
+            )
+            self.assertEqual(config.load_planner, expected)
+
+    def test_rejects_unknown_load_planner(self) -> None:
+        with self.assertRaises(ValueError):
+            SharedFileConfig.from_extra_config(
+                {"shared_storage_path": "/mnt/shared-kv", "load_planner": "maybe"}
+            )
+
+    def test_load_planner_defer_tolerance_defaults(self) -> None:
+        config = SharedFileConfig.from_extra_config({"shared_storage_path": "/mnt/shared-kv"})
+        self.assertEqual(config.load_planner_defer_tolerance, 2.0)
+
+    def test_parses_load_planner_defer_tolerance(self) -> None:
+        config = SharedFileConfig.from_extra_config(
+            {
+                "shared_storage_path": "/mnt/shared-kv",
+                "load_planner_defer_tolerance": "3.5",
+            }
+        )
+        self.assertEqual(config.load_planner_defer_tolerance, 3.5)
+
+    def test_rejects_non_positive_load_planner_defer_tolerance(self) -> None:
+        with self.assertRaises(ValueError):
+            SharedFileConfig.from_extra_config(
+                {
+                    "shared_storage_path": "/mnt/shared-kv",
+                    "load_planner_defer_tolerance": "0",
+                }
+            )
+
+    def test_load_planner_defer_deadline_max_s_defaults(self) -> None:
+        config = SharedFileConfig.from_extra_config({"shared_storage_path": "/mnt/shared-kv"})
+        self.assertEqual(config.load_planner_defer_deadline_max_s, 2.0)
+
+    def test_parses_load_planner_defer_deadline_max_s(self) -> None:
+        config = SharedFileConfig.from_extra_config(
+            {
+                "shared_storage_path": "/mnt/shared-kv",
+                "load_planner_defer_deadline_max_s": "5",
+            }
+        )
+        self.assertEqual(config.load_planner_defer_deadline_max_s, 5.0)
+
+    def test_rejects_non_positive_load_planner_defer_deadline_max_s(self) -> None:
+        with self.assertRaises(ValueError):
+            SharedFileConfig.from_extra_config(
+                {
+                    "shared_storage_path": "/mnt/shared-kv",
+                    "load_planner_defer_deadline_max_s": "0",
+                }
+            )
+
+    def test_rejects_removed_defer_deadline_steps_knob(self) -> None:
+        # Must fail loudly, not silently ignore a value someone tuned.
+        with self.assertRaises(ValueError) as ctx:
+            SharedFileConfig.from_extra_config(
+                {
+                    "shared_storage_path": "/mnt/shared-kv",
+                    "load_planner_defer_deadline_steps": "512",
+                }
+            )
+        self.assertIn("load_planner_defer_tolerance", str(ctx.exception))
+
 
 class FileMapperTests(unittest.TestCase):
     def test_rejects_absolute_model_name(self) -> None:

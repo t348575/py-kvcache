@@ -1,20 +1,25 @@
 from __future__ import annotations
 
 import collections
+import enum
 import logging
 import os
 import time
-from collections.abc import Iterable, Iterator, Mapping
+from collections.abc import Iterable, Iterator, Mapping, Sequence
 from concurrent.futures import Future
 from concurrent.futures import wait as futures_wait
 from dataclasses import dataclass
 from typing import Any
 
-from .break_even import load_break_even
+from .break_even import load_break_even, load_curves
+from .cost_model import build_cost_tables
 from .file_mapper import FileMapper
 from .fs_config import SharedFileConfig
+from .liburing_file import align_up
+from .load_planner import CandidateCostInput, LoadDecision, LoadPlanner
 from .profiling import add_event, now_ns
 from .reactor import LoadDeclined, TransferCoordinator
+from .staging import StagingPool
 from .transfer import ParsedKvLayout
 
 logger = logging.getLogger(__name__)
@@ -91,6 +96,39 @@ except Exception:
         job_id: int
         success: bool = True
 
+# Guarded separately: an installed-but-not-yet-patched vLLM (missing these
+# planned-defer types) must not flip VLLM_AVAILABLE off.
+try:
+    from vllm.v1.kv_offload.base import PlanCandidate, PlanDecision, PlanOutcome
+
+    PLAN_API_AVAILABLE = True
+except Exception:
+    PLAN_API_AVAILABLE = False
+
+    @dataclass(frozen=True)
+    class PlanCandidate:
+        position: int
+        req_id: str
+        recompute_tokens: int
+        keys: tuple[OffloadKey, ...]
+
+    class PlanDecision(str, enum.Enum):
+        ADMIT = "admit"
+        DEFER = "defer"
+        DECLINE = "decline"
+
+    @dataclass(frozen=True)
+    class PlanOutcome:
+        decision: PlanDecision
+        preload_blocks: int = 0
+
+
+_DECISION_TO_PLAN = {
+    LoadDecision.ADMIT: PlanDecision.ADMIT,
+    LoadDecision.DEFER: PlanDecision.DEFER,
+    LoadDecision.DECLINE: PlanDecision.DECLINE,
+}
+
 
 def _read_extra_config(vllm_config: Any, kv_cache_config: Any) -> Mapping[str, object]:
     for owner in (kv_cache_config, vllm_config):
@@ -125,6 +163,22 @@ def _first_int(value: Any, default: int) -> int:
         return default
 
 
+def _parse_non_negative_int(value: Any, *, name: str) -> int:
+    # Mirrors vllm's offloading connector scheduler's own parse of this key
+    # (absent -> 0) so config validation and the runtime scheduler never disagree.
+    if value is None:
+        return 0
+    if isinstance(value, bool):
+        raise ValueError(f"{name} must be a non-negative integer")
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{name} must be a non-negative integer") from exc
+    if parsed < 0:
+        raise ValueError(f"{name} must be a non-negative integer")
+    return parsed
+
+
 class SharedStorageLoadStoreSpec(LoadStoreSpec):
     def __init__(self, block_hashes: Iterable[bytes] = ()):
         self.block_hashes = list(block_hashes)
@@ -138,14 +192,20 @@ class SharedStorageOffloadingManager(OffloadingManager):
     def __init__(
         self,
         file_mapper: FileMapper,
+        *,
+        planner: LoadPlanner | None = None,
     ):
         self.file_mapper = file_mapper
         # Positive hits are immutable; misses not cached (another process can publish between steps).
         self._lookup_cache: dict[bytes, bool] = {}
+        # Hashes whose cache entry came from `_probe`, not yet observed by a real
+        # `lookup` call; drives the emit-once-per-hash profiling gate below.
+        self._probed_hashes: set[bytes] = set()
         self._last_io_req_id: str | None = None
         # hash -> count of in-flight stores; lookup() returns None (defer) so the scheduler
         # waits for the write and loads rather than recomputing a reusable prefix.
         self._store_inflight: dict[bytes, int] = {}
+        self._planner = planner
 
     @staticmethod
     def _get_block_hash(key: OffloadKey) -> bytes:
@@ -164,7 +224,70 @@ class SharedStorageOffloadingManager(OffloadingManager):
         req_id = self._req_id(req_context)
         if req_id != self._last_io_req_id:
             self._lookup_cache.clear()
+            self._probed_hashes.clear()
             self._last_io_req_id = req_id
+
+    def _probe(self, block_hash: bytes) -> tuple[bool, bool]:
+        """(exists, mid_write) via the same `_lookup_cache`/`_store_inflight` state
+        `lookup` uses, but with no profiling event and no defer semantics — so the
+        planner and `lookup` can never disagree about the filesystem."""
+        if block_hash in self._lookup_cache:
+            return True, False
+        exists = os.path.exists(self.file_mapper.get_file_name(block_hash))
+        if exists:
+            self._lookup_cache[block_hash] = True
+            self._probed_hashes.add(block_hash)
+            return True, False
+        return False, block_hash in self._store_inflight
+
+    @property
+    def supports_planned_defer_preload(self) -> bool:
+        return self._planner is not None
+
+    def plan_candidates(
+        self,
+        candidates: Sequence[PlanCandidate],
+        outstanding_load_blocks: Sequence[int] = (),
+    ) -> dict[str, PlanOutcome]:
+        if self._planner is None:
+            return {}
+
+        inputs: list[CandidateCostInput] = []
+        for candidate in candidates:
+            loadable_hashes: list[bytes] = []
+            blocked_on_store = False
+            for key in candidate.keys:
+                block_hash = self._get_block_hash(key)
+                exists, mid_write = self._probe(block_hash)
+                if exists:
+                    loadable_hashes.append(block_hash)
+                    continue
+                if mid_write:
+                    loadable_hashes.append(block_hash)
+                    blocked_on_store = True
+                    continue
+                break
+
+            inputs.append(
+                CandidateCostInput(
+                    position=candidate.position,
+                    req_id=candidate.req_id,
+                    recompute_tokens=candidate.recompute_tokens,
+                    load_blocks=len(loadable_hashes),
+                    loadable_hashes=tuple(loadable_hashes),
+                    blocked_on_store=blocked_on_store,
+                    predicted_dram_resident=False,
+                )
+            )
+
+        results = self._planner.plan(inputs, outstanding_load_blocks=outstanding_load_blocks)
+        return {
+            req_id: PlanOutcome(
+                decision=_DECISION_TO_PLAN[result.decision],
+                preload_blocks=result.preload_blocks,
+            )
+            for req_id, result in results.items()
+        }
 
     def lookup(self, key: OffloadKey, req_context: ReqContext) -> bool | None:
         start_ns = now_ns()
@@ -177,8 +300,10 @@ class SharedStorageOffloadingManager(OffloadingManager):
             if cached:
                 self._lookup_cache[block_hash] = True
         deferred = not cached and block_hash in self._store_inflight
-        # Only emit for real stat or deferral calls; cache hits repeat 100k+ times per file.
-        if not from_cache:
+        was_probed = block_hash in self._probed_hashes
+        self._probed_hashes.discard(block_hash)
+        # Emit once per hash; cache hits repeat 100k+ times per file otherwise.
+        if not from_cache or was_probed:
             add_event(
                 "py_kvcache.manager.lookup",
                 "kv_offload",
@@ -186,11 +311,18 @@ class SharedStorageOffloadingManager(OffloadingManager):
                 now_ns() - start_ns,
                 args={"hit": bool(cached), "cached": from_cache, "deferred": deferred},
             )
-        if cached:
-            return True
         if deferred:
-            return None  # mid-write: defer so scheduler waits for store, then loads
-        return False
+            # Correctness fence: mid-write always defers, regardless of any
+            # planner decision (stale or otherwise).
+            return None
+        if self._planner is not None:
+            req_id = self._req_id(req_context)
+            decision = self._planner.decision_for(req_id) if req_id is not None else None
+            if decision == LoadDecision.DECLINE:
+                return False
+            if decision == LoadDecision.DEFER:
+                return None
+        return cached
 
     def prepare_load(self, keys: Iterable[OffloadKey], req_context: ReqContext) -> LoadStoreSpec:
         self._maybe_flush_lookup_cache(req_context)
@@ -253,12 +385,16 @@ class SharedStorageOffloadingManager(OffloadingManager):
             else:
                 self._store_inflight.pop(block_hash, None)
             self._lookup_cache.pop(block_hash, None)
+            self._probed_hashes.discard(block_hash)
         return None
 
     def reset_cache(self) -> None:
         self._lookup_cache.clear()
+        self._probed_hashes.clear()
         self._last_io_req_id = None
         self._store_inflight.clear()
+        if self._planner is not None:
+            self._planner.reset()
         return None
 
 
@@ -511,9 +647,8 @@ class PyKvCacheOffloadingSpec(OffloadingSpec):
         )
         os.makedirs(self.file_mapper.base_path, exist_ok=True)
 
-        # Medium-aware break-even thresholds for the worker load gate. Disabled
-        # (no gating) when no file is configured. Read by the connector worker
-        # from the coordinator; not used scheduler-side (stores always happen).
+        # Worker load gate; disabled when no file is configured. Not used
+        # scheduler-side -- stores always happen.
         self.break_even = load_break_even(
             self.shared_file_config.prefix_cache_break_even_path,
             model_name=model_name,
@@ -521,9 +656,96 @@ class PyKvCacheOffloadingSpec(OffloadingSpec):
         )
         self.storage_block_tokens = gpu_block_size * block_size_factor
 
+        self._planner: LoadPlanner | None = None
+        if self.shared_file_config.load_planner == "on":
+            self._planner = self._build_planner(vllm_config, model_name=model_name, dtype=dtype)
+
+    def _build_planner(
+        self, vllm_config: VllmConfig, *, model_name: str, dtype: str
+    ) -> LoadPlanner:
+        curves = load_curves(
+            self.shared_file_config.prefix_cache_break_even_path,
+            model_name=model_name,
+            kv_dtype=dtype,
+        )
+        if curves is None:
+            raise ValueError(
+                "load_planner=on requires prefix_cache_break_even_path to point at "
+                "a v2 break-even file with a 'curves' section; a v1 file (or none) "
+                "has no curves to plan with"
+            )
+        if VLLM_AVAILABLE and not PLAN_API_AVAILABLE:
+            raise ValueError(
+                "load_planner=on requires a vLLM with the planned-defer preload API "
+                "(vllm.v1.kv_offload.base.PlanDecision); the installed vLLM does not "
+                "expose it, so plan_candidates would never be called"
+            )
+        if not self.shared_file_config.enable_preload:
+            raise ValueError("load_planner=on requires enable_preload=true")
+        if not self.shared_file_config.preload_share_staging:
+            raise ValueError(
+                "load_planner=on requires preload_share_staging=true; with per-"
+                "(req_id, hash) staging the planner's shared-prefix pricing charges "
+                "one slot where the reactor holds one per requesting request"
+            )
+
+        preload_lookahead_requests = _parse_non_negative_int(
+            self.extra_config.get("preload_lookahead_requests"),
+            name="preload_lookahead_requests",
+        )
+        if preload_lookahead_requests <= 0:
+            raise ValueError("load_planner=on requires preload_lookahead_requests > 0")
+
+        if bool(_get_nested_attr(vllm_config, ("cache_config", "enable_prefix_caching"), False)):
+            raise ValueError(
+                "load_planner=on is incompatible with local GPU prefix caching "
+                "(vllm_config.cache_config.enable_prefix_caching); the planner prices "
+                "recompute_tokens as the 0%-prefix token count"
+            )
+
+        if curves.kv_bytes_per_token is None:
+            raise ValueError(
+                "load_planner=on requires kv_bytes_per_token in the break-even file"
+            )
+
+        max_model_len = _first_int(
+            _get_nested_attr(vllm_config, ("model_config", "max_model_len"), 0), 0
+        )
+        if max_model_len <= 0:
+            raise ValueError(
+                "load_planner=on requires a positive vllm_config.model_config.max_model_len"
+            )
+        tables = build_cost_tables(
+            curves,
+            block_tokens=self.storage_block_tokens,
+            max_model_len=max_model_len,
+        )
+
+        # The scheduler has no staging pool; mirror the reactor's own
+        # max_preload_slots derivation so the planner's budget tracks it. A
+        # wrong estimate just degrades to a foreground read.
+        io_size = align_up(curves.kv_bytes_per_token * self.storage_block_tokens)
+        copy_headroom = max(4, self.shared_file_config.iodepth // 2)
+        slot_count = StagingPool.compute_slot_count(
+            staging_mem_gib=self.shared_file_config.staging_mem,
+            io_size=io_size,
+            min_slots=self.shared_file_config.iodepth + copy_headroom,
+        )
+        max_preload_slots = max(0, slot_count - self.shared_file_config.iodepth)
+
+        return LoadPlanner(
+            tables,
+            max_preload_slots=max_preload_slots,
+            defer_tolerance=self.shared_file_config.load_planner_defer_tolerance,
+            defer_deadline_max_s=self.shared_file_config.load_planner_defer_deadline_max_s,
+        )
+
     def get_manager(self) -> OffloadingManager:
         if self._manager is None:
-            self._manager = SharedStorageOffloadingManager(self.file_mapper)
+            self._manager = SharedStorageOffloadingManager(
+                self.file_mapper,
+                planner=self._planner,
+            )
         return self._manager
 
     def get_handlers(
@@ -602,5 +824,6 @@ __all__ = [
     "SharedStorageLoadStoreSpec",
     "SharedStorageOffloadingManager",
     "SharedStorageOffloadingSpec",
+    "PLAN_API_AVAILABLE",
     "VLLM_AVAILABLE",
 ]

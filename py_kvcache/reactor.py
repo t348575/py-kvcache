@@ -566,11 +566,8 @@ class IoReactor:
                     break
                 self._pump_once()
         except BaseException as exc:
-            # The reactor owns every outstanding transfer Future. If this thread
-            # dies, vLLM blocks forever (loads never free GPU blocks, stores never
-            # signal complete_store -> requests wedge as Running:0 / Deferred:N).
-            # Surface the traceback and fail all outstanding work so the engine
-            # gets errors (recompute/retry) instead of a silent deadlock.
+            # Fail every outstanding Future so vLLM gets errors instead of
+            # blocking forever waiting on this dead thread.
             logger.exception("py-kvcache reactor thread crashed; failing all outstanding transfers")
             self._fail_everything(exc)
 
@@ -710,9 +707,7 @@ class IoReactor:
         else:
             producer = job.profile.req_id
             for h in job.block_hashes:
-                # A request never loads a prefix it produced, so withdraw its own
-                # speculative demand; else a FRESH unique-prefix store would re-arm
-                # a pointless read-back of its just-written bytes.
+                # A request never loads a prefix it produced; withdraw its own demand.
                 if self._share_preload:
                     self._shared_decref(producer, h)
                 missed = self._known_missing.pop(h, None)
@@ -734,9 +729,7 @@ class IoReactor:
         self._active.append(job)
 
     def _should_decline_load(self, job: "_ReactorJob") -> bool:
-        # Medium is RAM only if every block is already cheaply available (cached
-        # or an in-flight/cached preload copy) -> no fresh disk read on this load.
-        # Otherwise a fresh SSD read is required -> SSD threshold applies.
+        # RAM medium only if every block is already staged/cached; else SSD.
         prefix_tokens = job.total_files * self._storage_block_tokens
         if prefix_tokens <= 0:
             return False
@@ -1176,8 +1169,7 @@ class IoReactor:
             self._release_store_inflight(job.block_hashes[op.file_index], ok=False)
 
     def _can_issue_store(self) -> bool:
-        # Device budget released at CQE reap, not at CUDA copy completion.
-        # Slot acquisition is _schedule_one's job (evicts a preload slot if full).
+        # Device budget releases at CQE reap, not CUDA copy completion.
         return self._data_inflight < self.iodepth
 
     def _can_open(self) -> bool:
@@ -1286,8 +1278,7 @@ class IoReactor:
         shared: "_SharedPreloadSlot | None",
         cache: "_CacheSlot | None",
     ) -> None:
-        # Disk bytes stay valid regardless of the GPU copy outcome (immutable
-        # hash), so success, empty, and error completions all settle here.
+        # Immutable hash: disk bytes stay valid regardless of GPU copy outcome.
         if cache is not None:
             self._staging_cache.unpin(cache)
         elif shared is None:
@@ -1390,10 +1381,8 @@ class IoReactor:
             while self._preload_pending and self._can_open() and self._preload_slots_available():
                 info = self._preload_pending[0]
                 h = info.block_hash
-                # No cross-copy dedup here: each pending entry is a distinct
-                # request's demand for its own staged copy (intake already
-                # deduped per (req_id, hash)). An already-inflight/cached copy
-                # belongs to another request and does not satisfy this one.
+                # No cross-copy dedup: each pending entry is a distinct request's
+                # own demand (intake already deduped per (req_id, hash)).
                 if self._preload_pending_cancel.get(h, 0) > 0:
                     self._preload_pending.popleft()
                     self._consume_pending_cancel(h)
@@ -1662,9 +1651,8 @@ class IoReactor:
         )
 
     def _submit_open_preload(self, info: "_PreloadInfo") -> None:
-        # The async openat IS the existence check: a miss flows to _known_missing
-        # so a later store re-arms the readback. Do NOT pre-gate with os.path.exists
-        # — it stalls the pump and breaks the store->preload re-arm chain.
+        # The async openat IS the existence check; a miss flows to _known_missing.
+        # Do not pre-gate with os.path.exists -- it stalls the pump.
         block_hash = info.block_hash
         final_path = self.file_mapper.get_file_name(block_hash)
         user_data = self._new_user_data()
@@ -1799,9 +1787,7 @@ class IoReactor:
             self._release_store_inflight(job.block_hashes[file_index], ok=False)
             return False
         # A store occupies one device-budget unit from copy-launch through
-        # write-completion (one unit, two phases): without this, _can_issue_store
-        # never sees in-flight store copies and launches up to slot_count of them,
-        # then drains every write into the SQ in one pump -> SQ overflow.
+        # write-completion, else _can_issue_store over-launches and overflows the SQ.
         self._data_inflight += 1
         self._pending_copies.append(copy)
         return True
