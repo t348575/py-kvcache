@@ -307,8 +307,7 @@ def emit_transfer_events(
             "num_files": num_files,
             "num_blocks": num_blocks,
             "file_io_bw_GBps": _bandwidth(file_samples),
-            # Per-block load source breakdown (zeros for stores). Flat scalars:
-            # the trace viewer renders nested dicts as "[object Object]".
+            # Flat scalars, not a nested dict -- the trace viewer renders those as "[object Object]".
             "src_file": n_from_file,
             "src_preload": n_from_preload,
             "src_cache": n_from_cache,

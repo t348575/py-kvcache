@@ -458,12 +458,7 @@ class KnownMissingTest(unittest.TestCase):
         self.assertEqual(list(r._known_missing), [b"\x01", b"\x02"])
 
     def test_submit_open_preload_submits_without_exists_gate(self):
-        # The async openat IS the existence check: _submit_open_preload no longer
-        # pre-stats. A block not yet on disk still gets an openat submitted; its
-        # miss is handled in _on_open_complete (recorded in _known_missing so a
-        # later store re-arms it). A synchronous os.path.exists gate here would
-        # both stall the pump and drop the not-yet-written block, breaking the
-        # store->preload re-arm chain.
+        # The async openat IS the existence check; no os.path.exists pre-stat.
         r = _bare_reactor()
         r._next_user_data = 0
         r._open_inflight = 0

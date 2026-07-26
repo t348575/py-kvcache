@@ -110,9 +110,7 @@ class LookupCacheTest(unittest.TestCase):
         self.assertIsNone(self.m._last_io_req_id)
 
     def test_event_only_on_real_work(self) -> None:
-        # Cache-hit lookups are silent: the scheduler re-probes each waiting
-        # request's full prefix every step, so emitting an event per cached hit
-        # buries the trace. Only the cold lookup (a real os.path.exists) emits.
+        # Cache-hit lookups are silent; only the cold lookup emits.
         self.existing.add(b"a")
         events: list[dict] = []
         orig = vmod.add_event

@@ -248,8 +248,7 @@ class BreakEvenDeclineE2eTest(unittest.TestCase):
                 f,
             )
 
-        # No kv_load_failure_policy here on purpose: OffloadingConnector forces
-        # "recompute" itself, so declined loads recompute without extra config.
+        # No kv_load_failure_policy needed: OffloadingConnector forces "recompute" itself.
         kv_cfg = {
             "kv_connector": "OffloadingConnector",
             "kv_role": "kv_both",

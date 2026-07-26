@@ -189,10 +189,7 @@ class LiburingRing:
         head = int(self._sq_head[0])
         tail = int(self._sq_tail[0])
         if tail - head >= self._params.sq_entries:
-            # A single pump can queue more SQEs than the ring holds (reads +
-            # writes + opens + a burst of trailing closes). Flush what is queued
-            # to the kernel (non-blocking; frees every SQ slot) and retry rather
-            # than raising — a full SQ is backpressure, not an error.
+            # A full SQ is backpressure, not an error -- flush and retry.
             self.submit_pending()
             head = int(self._sq_head[0])
             tail = int(self._sq_tail[0])
